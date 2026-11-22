@@ -1,8 +1,8 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 import pg from 'pg';
-import { RestClientV5 } from 'bybit-api';
 
 dotenv.config();
 
@@ -13,7 +13,7 @@ app.use(express.json());
 app.use(
   cors({
     origin: process.env.ALLOWED_ORIGIN || '*',
-    allowedHeaders: ['Content-Type', 'x-admin-secret', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'x-admin-secret', 'x-admin-key', 'Authorization'],
     methods: ['GET', 'POST', 'OPTIONS'],
   })
 );
@@ -23,7 +23,7 @@ app.use(
 // ==========================================
 const DEFAULTS = {
   SYMBOL: 'SOLUSDT',
-  TRADE_AMOUNT_USDT: 5.5,        // Above $5 Bybit spot minimum
+  TRADE_AMOUNT_USDT: 5.5,        // Above $5 Binance spot minimum
   BUY_DIP_PERCENT: 0.02,         // -2.0% dip from referencePrice
   TAKE_PROFIT_PERCENT: 0.05,     // +5.0% hard take-profit fallback
   STOP_LOSS_PERCENT: 0.03,       // -3.0% hard stop-loss
@@ -43,7 +43,7 @@ const DEFAULTS = {
 };
 
 // ==========================================
-// 2. NEON DB & BYBIT CLIENTS
+// 2. NEON DB & BINANCE SPOT CONFIG
 // ==========================================
 if (!process.env.DATABASE_URL) {
   console.error('Missing DATABASE_URL in environment variables.');
@@ -55,11 +55,74 @@ const db = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-const client = new RestClientV5({
-  key: process.env.BYBIT_API_KEY,
-  secret: process.env.BYBIT_API_SECRET,
-  testnet: process.env.USE_TESTNET !== 'false',
-});
+// FIX 1: Env fix - supports both BINANCE_TESTNET and USE_TESTNET
+const USE_BINANCE_TESTNET = (process.env.BINANCE_TESTNET ?? process.env.USE_TESTNET ?? 'true') !== 'false';
+const BINANCE_BASE_URL = USE_BINANCE_TESTNET
+  ? 'https://testnet.binance.vision/api'
+  : 'https://api.binance.com/api'; //
+
+const BINANCE_API_KEY = process.env.BINANCE_API_KEY || '';
+const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET || '';
+
+// FIX BUG 1: Binance server time offset - fixes -1021 timestamp error on Render
+let binanceTimeOffset = 0;
+
+async function binancePublicRequest(path, params = {}) {
+  const qs = new URLSearchParams(params).toString();
+  const url = `${BINANCE_BASE_URL}${path}${qs ? `?${qs}` : ''}`;
+  const res = await fetch(url);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.code) {
+    throw new Error(data.msg || `Binance public request failed (${res.status})`);
+  }
+  return data;
+}
+
+async function syncBinanceTime() {
+  try {
+    const data = await binancePublicRequest('/v3/time');
+    binanceTimeOffset = data.serverTime - Date.now();
+    console.log(`Binance time synced, offset: ${binanceTimeOffset}ms`);
+  } catch (err) {
+    console.error('Binance time sync failed, using local time:', err.message);
+    binanceTimeOffset = 0;
+  }
+}
+
+function signBinanceParams(params = {}) {
+  if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
+    throw new Error('Missing BINANCE_API_KEY or BINANCE_API_SECRET in environment variables.');
+  }
+  // FIX BUG 1: use Binance server time + recvWindow
+  const query = new URLSearchParams({
+    ...params,
+    recvWindow: '5000',
+    timestamp: (Date.now() + binanceTimeOffset).toString(),
+  }).toString();
+
+  const signature = crypto
+    .createHmac('sha256', BINANCE_API_SECRET)
+    .update(query)
+    .digest('hex');
+
+  return `${query}&signature=${signature}`;
+}
+
+async function binanceSignedRequest(method, path, params = {}) {
+  const signedQs = signBinanceParams(params);
+  const url = `${BINANCE_BASE_URL}${path}?${signedQs}`;
+  const res = await fetch(url, {
+    method,
+    headers: {
+      'X-MBX-APIKEY': BINANCE_API_KEY,
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.code) {
+    throw new Error(data.msg || `Binance signed request failed (${res.status})`);
+  }
+  return data;
+}
 
 // ==========================================
 // 3. BOT STATE
@@ -114,6 +177,15 @@ async function initDatabase() {
       outcome TEXT,
       reason TEXT,
       closed_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+
+  // MERGE 2: bot_logs table from my version - logs survive restarts
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS bot_logs (
+      id SERIAL PRIMARY KEY,
+      message TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
 
@@ -205,6 +277,8 @@ function addLog(message) {
   console.log(entry);
   state.logs.unshift(entry);
   if (state.logs.length > 100) state.logs.pop();
+  // MERGE 2: Save log to Neon - fire and forget, does not block trading logic
+  db.query('INSERT INTO bot_logs (message) VALUES ($1)', [entry]).catch(() => {});
 }
 
 function getLagosTimeInfo() {
@@ -248,55 +322,49 @@ async function setReferencePrice(price) {
 }
 
 // ==========================================
-// 6. BYBIT EXCHANGE FUNCTIONS
+// 6. BINANCE EXCHANGE FUNCTIONS
 // ==========================================
 async function fetchLivePrice() {
-  const res = await client.getTickers({
-    category: 'spot',
+  const data = await binancePublicRequest('/v3/ticker/price', {
     symbol: DEFAULTS.SYMBOL,
-  });
-  if (res.retCode !== 0 || !res.result?.list?.length) {
-    throw new Error(`Ticker fetch failed: ${res.retMsg}`);
+  }); //
+  const price = parseFloat(data.price);
+  if (!Number.isFinite(price) || price <= 0) {
+    throw new Error('Ticker fetch failed: invalid price');
   }
-  return parseFloat(res.result.list[0].lastPrice);
+  return price;
 }
 
 async function getSolAvailableBalance() {
-  const res = await client.getWalletBalance({
-    accountType: 'UNIFIED',
-    coin: 'SOL',
-  });
-  if (res.retCode !== 0) {
-    throw new Error(`Balance fetch failed: ${res.retMsg}`);
-  }
-  const coinInfo = res.result?.list?.[0]?.coin?.find((c) => c.coin === 'SOL');
-  return coinInfo ? parseFloat(coinInfo.walletBalance) : 0;
+  const data = await binanceSignedRequest('GET', '/v3/account');
+  const assetInfo = Array.isArray(data.balances)
+    ? data.balances.find((b) => b.asset === 'SOL')
+    : null;
+  return assetInfo ? parseFloat(assetInfo.free) : 0;
 }
 
 async function executeMarketBuy(currentPrice) {
   const amountUsdt = Number(state.tradeAmountUsdt);
   if (!Number.isFinite(amountUsdt) || amountUsdt < 5) {
-    throw new Error(`Invalid tradeAmountUsdt (${amountUsdt}). Must be at least $5.`);
+    throw new Error(`Invalid tradeAmountUsdt (${amountUsdt}).Must be at least $5.`);
   }
 
   addLog(`Dip + bounce confirmed! Buying $${amountUsdt} of ${DEFAULTS.SYMBOL} @ $${currentPrice.toFixed(4)}...`);
 
-  const orderRes = await client.submitOrder({
-    category: 'spot',
-    symbol: DEFAULTS.SYMBOL,
-    side: 'Buy',
-    orderType: 'Market',
-    qty: amountUsdt.toString(),
-    marketUnit: 'quoteCoin',
-  });
+  // FIX 2: Snapshot balance BEFORE buy, so we only count what bot bought
+  const solBalBefore = await getSolAvailableBalance();
 
-  if (orderRes.retCode !== 0) {
-    throw new Error(`Buy order failed: ${orderRes.retMsg}`);
-  }
+  await binanceSignedRequest('POST', '/v3/order', {
+    symbol: DEFAULTS.SYMBOL,
+    side: 'BUY',
+    type: 'MARKET',
+    quoteOrderQty: amountUsdt.toFixed(2),
+  }); //
 
   await new Promise((r) => setTimeout(r, 2000));
-  const solBal = await getSolAvailableBalance();
-  const sellableQty = Math.floor(solBal * 100) / 100;
+  const solBalAfter = await getSolAvailableBalance();
+  // FIX 2 + BUG 3: only the delta, floored to 0.001 step
+  const sellableQty = Math.floor((solBalAfter - solBalBefore) * 1000) / 1000;
 
   if (sellableQty <= 0) {
     throw new Error('Buy settled with 0 sellable SOL quantity (check minimum precision/balance).');
@@ -322,8 +390,9 @@ async function executeMarketBuy(currentPrice) {
 async function executeMarketSell(currentPrice, reason) {
   addLog(`Closing position (${reason}) at $${currentPrice.toFixed(4)}...`);
 
+  // FIX 2: Sell ONLY what bot bought, not whole wallet. Cap by balance for safety.
   const solBal = await getSolAvailableBalance();
-  const qtyToSell = Math.floor(solBal * 100) / 100;
+  const qtyToSell = Math.floor(Math.min(state.purchasedQty || 0, solBal) * 1000) / 1000;
 
   if (qtyToSell <= 0) {
     addLog('Warning: No SOL balance found to sell. Resetting position state.');
@@ -338,18 +407,12 @@ async function executeMarketSell(currentPrice, reason) {
     return;
   }
 
-  const orderRes = await client.submitOrder({
-    category: 'spot',
+  await binanceSignedRequest('POST', '/v3/order', {
     symbol: DEFAULTS.SYMBOL,
-    side: 'Sell',
-    orderType: 'Market',
-    qty: qtyToSell.toString(),
-    marketUnit: 'baseCoin',
-  });
-
-  if (orderRes.retCode !== 0) {
-    throw new Error(`Sell order failed: ${orderRes.retMsg}`);
-  }
+    side: 'SELL',
+    type: 'MARKET',
+    quantity: qtyToSell.toString(),
+  }); //
 
   const entryRef = state.entryPrice || currentPrice;
   const grossPnl = (currentPrice - entryRef) * qtyToSell;
@@ -523,12 +586,14 @@ function requireAdminAuth(req, res, next) {
     return res.status(500).json({ error: 'ADMIN_SECRET is not configured on the server.' });
   }
 
-  const headerSecret = req.headers['x-admin-secret'];
+  const headerSecret = req.headers['x-admin-secret'] || req.headers['x-admin-key'];
   const authHeader = req.headers['authorization'];
   const bearerToken =
     authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+  // MERGE 5: Allow ?key= for iPhone Safari - no header needed
+  const queryKey = req.query.key || req.query.adminKey;
 
-  const provided = headerSecret || bearerToken;
+  const provided = headerSecret || bearerToken || queryKey;
   if (!provided || provided !== secret) {
     return res.status(401).json({ error: 'Unauthorized: invalid or missing admin secret.' });
   }
@@ -536,14 +601,28 @@ function requireAdminAuth(req, res, next) {
   next();
 }
 
-// Lightweight public health route for Render & UptimeRobot
+// MERGE 1: Full public status - for Render, UptimeRobot & quick iPhone check
 app.get('/', (req, res) => {
   res.json({
     service: 'SOL/USDT Spot Bot Backend',
-    network: process.env.USE_TESTNET !== 'false' ? 'BYBIT_TESTNET' : 'BYBIT_LIVE',
+    network: USE_BINANCE_TESTNET ? 'BINANCE_TESTNET' : 'BINANCE_LIVE',
     status: state.isRunning ? 'RUNNING' : 'PAUSED',
     dateWAT: state.currentDate,
     lastPrice: state.lastPrice,
+    inPosition: state.inPosition,
+    referencePrice: state.referencePrice,
+    buyTargetPrice: state.buyTargetPrice,
+    takeProfitPrice: state.takeProfitPrice,
+    stopLossPrice: state.stopLossPrice,
+    highestPriceSinceEntry: state.highestPriceSinceEntry,
+    trailingActive: state.trailingActive,
+    statsToday: {
+      trades: `${state.tradesToday}/${DEFAULTS.MAX_TRADES_PER_DAY}`,
+      wins: state.winsToday,
+      losses: state.lossesToday,
+      consecutiveLosses: state.consecutiveLosses,
+      dailyPnlUsdt: state.dailyPnlUsdt,
+    },
   });
 });
 
@@ -552,7 +631,7 @@ app.get('/api/admin/dashboard', requireAdminAuth, async (req, res) => {
   try {
     const trades = await getRecentTradesFromDb(50);
     res.json({
-      network: process.env.USE_TESTNET !== 'false' ? 'BYBIT_TESTNET' : 'BYBIT_LIVE',
+      network: USE_BINANCE_TESTNET ? 'BINANCE_TESTNET' : 'BINANCE_LIVE',
       status: state.isRunning ? 'RUNNING' : 'PAUSED',
       config: {
         symbol: DEFAULTS.SYMBOL,
@@ -691,19 +770,26 @@ app.post('/api/admin/panic-sell', requireAdminAuth, async (req, res) => {
 // ==========================================
 const PORT = process.env.PORT || 3000;
 
+// MERGE 4: Don't crash if Neon hiccups - start anyway with in-memory state
 initDatabase()
   .then(() => {
-    app.listen(PORT, () => {
-      addLog(
-        `Server started on port ${PORT} (${
-          process.env.USE_TESTNET !== 'false' ? 'BYBIT_TESTNET' : 'BYBIT_LIVE'
-        }) with Neon DB`
-      );
-      runTradingCycle();
-      setInterval(runTradingCycle, DEFAULTS.POLL_INTERVAL_MS);
-    });
+    console.log('Neon DB connected');
   })
   .catch((err) => {
-    console.error('Database initialization failed:', err.message);
-    process.exit(1);
+    console.error('Database initialization failed, continuing with in-memory state:', err.message);
+  })
+  .finally(() => {
+    app.listen(PORT, async () => {
+      addLog(
+        `Server started on port ${PORT} (${
+          USE_BINANCE_TESTNET ? 'BINANCE_TESTNET' : 'BINANCE_LIVE'
+        }) with Neon DB`
+      );
+      // FIX BUG 1: sync time before first trade
+      await syncBinanceTime();
+      runTradingCycle();
+      setInterval(runTradingCycle, DEFAULTS.POLL_INTERVAL_MS);
+      // FIX 3: re-sync Binance time every hour so -1021 never comes back
+      setInterval(syncBinanceTime, 60 * 60 * 1000);
+    });
   });
