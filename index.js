@@ -23,7 +23,7 @@ app.use(
 // ==========================================
 const DEFAULTS = {
   SYMBOL: 'SOLUSDT',
-  TRADE_AMOUNT_USDT: 5.5,        // Fallback only - live uses dynamic balance
+  TRADE_AMOUNT_USDT: 5.5,        // Dashboard Total Amount - bot uses EXACTLY this per trade, NOT 99% of balance
   MIN_TRADE_USDT: 5.10,          // Must stay above Binance $5.00 minimum
   BUY_DIP_PERCENT: 0.02,         // -2.0% dip from referencePrice
   TAKE_PROFIT_PERCENT: 0.05,     // +5.0% hard take-profit fallback
@@ -33,11 +33,13 @@ const DEFAULTS = {
   REQUIRE_BOUNCE_TICK: true,     // Require livePrice > lastPrice on dip trigger
   PRICE_WINDOW_SIZE: 20,         // Rolling price samples for context
   FEE_RATE_PER_SIDE: 0.001,      // ~0.1% spot fee estimate per side
-  MAX_TRADES_PER_DAY: 5,
+  // UPDATED: MAX_TRADES_PER_DAY REMOVED - No limit, keep going 24/7
   MAX_CONSECUTIVE_LOSSES: 2,     // UPDATED: was 3 -> 2 for live
-  MAX_DAILY_LOSS_USDT: 0.45,     // UPDATED: was 3.0 -> 0.45 to keep balance above $5.00
+  // UPDATED: Daily loss is AUTO = TRADE_AMOUNT * 0.08. $5.50 -> $0.44, $100 -> $8.00
+  DAILY_LOSS_PERCENT_OF_AMOUNT: 0.08,
+  MAX_DAILY_LOSS_USDT: 0.44,     // Auto-calculated from TRADE_AMOUNT_USDT, do not set manually
   COOLDOWN_MINUTES: 30,
-  POLL_INTERVAL_MS: 60 * 1000,
+  POLL_INTERVAL_MS: 30 * 1000,   // UPDATED: was 60s -> 30s
   TIMEZONE: 'Africa/Lagos',
   // REMOVED: ACTIVE_START_HOUR / ACTIVE_END_HOUR - now True 24/7
 };
@@ -143,6 +145,11 @@ let state = {
   logs: [],
 };
 
+// NEW: Helper - Daily loss sets itself from Total Amount in dashboard
+function calcDailyLossFromAmount(amountUsdt) {
+  return Number((amountUsdt * DEFAULTS.DAILY_LOSS_PERCENT_OF_AMOUNT).toFixed(2));
+}
+
 // ==========================================
 // 4. DATABASE INITIALIZATION & PERSISTENCE
 // ==========================================
@@ -180,14 +187,16 @@ async function initDatabase() {
     state = {
       ...state,
       ...res.rows[0].data,
-      // Force live safety values even if old DB has old 3.0 / 3 losses saved
-      maxDailyLossUsdt: DEFAULTS.MAX_DAILY_LOSS_USDT,
+      // UPDATED: Auto daily loss from saved tradeAmount, never use old saved 0.45 / 3.0
+      tradeAmountUsdt: Number(res.rows[0].data.tradeAmountUsdt || DEFAULTS.TRADE_AMOUNT_USDT),
+      maxDailyLossUsdt: calcDailyLossFromAmount(Number(res.rows[0].data.tradeAmountUsdt || DEFAULTS.TRADE_AMOUNT_USDT)),
       logs: Array.isArray(res.rows[0].data.logs) ? res.rows[0].data.logs.slice(0, 100) : [],
       priceHistory: Array.isArray(res.rows[0].data.priceHistory)
         ? res.rows[0].data.priceHistory.slice(-DEFAULTS.PRICE_WINDOW_SIZE)
         : [],
     };
   } else {
+    state.maxDailyLossUsdt = calcDailyLossFromAmount(state.tradeAmountUsdt);
     await saveStateToDb();
   }
 }
@@ -329,7 +338,9 @@ async function resetDailyStats(newDateStr) {
   state.lossesToday = 0;
   state.dailyPnlUsdt = 0;
   state.cooldownUntil = null;
-  addLog(`New trading day initialized (${newDateStr}). Daily counters reset.`);
+  // UPDATED: Daily loss resets daily and is auto-calculated from dashboard Total Amount
+  state.maxDailyLossUsdt = calcDailyLossFromAmount(state.tradeAmountUsdt);
+  addLog(`New trading day initialized (${newDateStr}). Daily counters reset. Total Amount: $${state.tradeAmountUsdt} | Auto Daily Loss Limit: $${state.maxDailyLossUsdt}`);
   await saveStateToDb();
 }
 
@@ -349,6 +360,23 @@ async function updateTrailingReference(livePrice) {
     state.buyTargetPrice = Number((livePrice * (1 - DEFAULTS.BUY_DIP_PERCENT)).toFixed(4));
     addLog(`Trailing UP: Reference $${state.referencePrice.toFixed(4)} | New Buy Target: $${state.buyTargetPrice}`);
     await saveStateToDb();
+  }
+}
+
+// UPDATED 2026-11-23: TREND FILTER FIX - slice(-6,-1) = last 5 FINISHED days, excludes today's forming candle.
+// Old slice(-5) included today, so price was compared to itself and filter barely blocked.
+async function isUptrend(livePrice) {
+  try {
+    const klines = await binancePublicRequest('/v3/klines', { symbol: DEFAULTS.SYMBOL, interval: '1d', limit: 6 });
+    if (!Array.isArray(klines) || klines.length < 6) return true;
+    const closes = klines.slice(-6, -1).map((k) => parseFloat(k[4]));
+    const avg = closes.reduce((a, b) => a + b, 0) / closes.length;
+    const up = livePrice > avg;
+    if (!up) addLog(`TREND FILTER BLOCKED BUY: Price $${livePrice.toFixed(4)} is BELOW 5-day avg $${avg.toFixed(4)} (downtrend) - Waiting`);
+    return up;
+  } catch (err) {
+    addLog(`Trend check failed (${err.message}) - allowing buy to keep old behaviour`);
+    return true;
   }
 }
 
@@ -376,15 +404,18 @@ async function getUsdtAvailableBalance() {
 }
 
 async function executeMarketBuy(currentPrice) {
-  // NEW: Dynamic sizing - use real balance, not hardcoded 5.5
+  // UPDATED 2026-11-23: HYBRID AMOUNT - Fixed + 99% cut.
+  // Dashboard amount is the TARGET. Actual buy = min(Dashboard, Free x 0.99).
+  // So if balance drops after a loss, bot buys a little smaller and NEVER deadlocks.
+  // Dashboard amount (state.tradeAmountUsdt) is NOT overwritten, so Auto Daily Loss stays correct.
+  const dashboardAmount = Number(state.tradeAmountUsdt || DEFAULTS.TRADE_AMOUNT_USDT);
   const freeUsdt = await getUsdtAvailableBalance();
-  if (freeUsdt < DEFAULTS.MIN_TRADE_USDT) {
-    throw new Error(`Insufficient USDT: free $${freeUsdt.toFixed(2)} < minimum $${DEFAULTS.MIN_TRADE_USDT}. Skipping buy.`);
+  const amountUsdt = Number(Math.min(dashboardAmount, freeUsdt * 0.99).toFixed(2));
+  if (amountUsdt < DEFAULTS.MIN_TRADE_USDT) {
+    throw new Error(`Trade amount $${amountUsdt.toFixed(2)} < minimum $${DEFAULTS.MIN_TRADE_USDT}. Increase Total Amount in dashboard or top up USDT. Free: $${freeUsdt.toFixed(2)} | Dashboard: $${dashboardAmount.toFixed(2)}`);
   }
-  const amountUsdt = Number((freeUsdt * 0.99).toFixed(2));
-  state.tradeAmountUsdt = amountUsdt; // save for dashboard / compounding
 
-  addLog(`Dip + bounce confirmed! Buying $${amountUsdt} of ${DEFAULTS.SYMBOL} @ ~$${currentPrice.toFixed(4)} (Free USDT: $${freeUsdt.toFixed(2)})...`);
+  addLog(`Dip + bounce + UPTREND confirmed! Buying $${amountUsdt.toFixed(2)} of ${DEFAULTS.SYMBOL} @ ~$${currentPrice.toFixed(4)} (Dashboard: $${dashboardAmount.toFixed(2)} | Free USDT: $${freeUsdt.toFixed(2)})...`);
 
   const solBalBefore = await getSolAvailableBalance();
 
@@ -508,10 +539,10 @@ async function runTradingCycle() {
       return;
     }
 
-    // 2. DAILY CIRCUIT BREAKERS - UNTOUCHED LOGIC, NEW LIMITS FROM DEFAULTS
-    if (state.tradesToday >= DEFAULTS.MAX_TRADES_PER_DAY) return;
+    // 2. DAILY CIRCUIT BREAKERS - UPDATED: NO MAX TRADES PER DAY, 24/7
+    // REMOVED: if (state.tradesToday >= MAX_TRADES_PER_DAY) return;
     if (state.consecutiveLosses >= DEFAULTS.MAX_CONSECUTIVE_LOSSES) return; // now 2
-    if (state.dailyPnlUsdt <= -Math.abs(Number(state.maxDailyLossUsdt))) return; // now -0.45
+    if (state.dailyPnlUsdt <= -Math.abs(Number(state.maxDailyLossUsdt))) return; // auto from dashboard Total Amount
 
     // 3. REMOVED: ACTIVE WAT HOURS CHECK - Now True 24/7
 
@@ -528,10 +559,16 @@ async function runTradingCycle() {
     // 5b. NEW: TRAILING REFERENCE UPWARD - only when not in position
     await updateTrailingReference(livePrice);
 
-    // 6. DIP + BOUNCE BUY TRIGGER - UNTOUCHED LOGIC
+    // 6. DIP + BOUNCE BUY TRIGGER - UNTOUCHED LOGIC + NEW TREND FILTER CHECK FIRST
     const dipReached = livePrice <= state.buyTargetPrice;
     const bounceConfirmed = !state.requireBounceTick || prevPrice === null || livePrice > prevPrice;
     if (dipReached && bounceConfirmed) {
+      // NEW: Don't buy in downtrend - check FIRST before buying
+      const uptrend = await isUptrend(livePrice);
+      if (!uptrend) {
+        await saveStateToDb();
+        return;
+      }
       await executeMarketBuy(livePrice);
     } else {
       await saveStateToDb();
@@ -572,7 +609,7 @@ app.get('/', (req, res) => {
     highestPriceSinceEntry: state.highestPriceSinceEntry,
     trailingActive: state.trailingActive,
     statsToday: {
-      trades: `${state.tradesToday}/${DEFAULTS.MAX_TRADES_PER_DAY}`,
+      trades: state.tradesToday, // UPDATED: No daily limit, shows total count only
       wins: state.winsToday, losses: state.lossesToday,
       consecutiveLosses: state.consecutiveLosses, dailyPnlUsdt: state.dailyPnlUsdt,
     },
@@ -596,7 +633,7 @@ app.get('/api/admin/dashboard', requireAdminAuth, async (req, res) => {
         trailStartPercent: DEFAULTS.TRAIL_START_PERCENT,
         trailPullbackPercent: DEFAULTS.TRAIL_PULLBACK_PERCENT,
         stopLossPercent: DEFAULTS.STOP_LOSS_PERCENT,
-        maxTradesPerDay: DEFAULTS.MAX_TRADES_PER_DAY,
+        maxTradesPerDay: 'UNLIMITED - 24/7',
         maxConsecutiveLosses: DEFAULTS.MAX_CONSECUTIVE_LOSSES,
         activeHoursWAT: '24/7 - No Restriction',
       },
@@ -612,7 +649,7 @@ app.get('/api/admin/dashboard', requireAdminAuth, async (req, res) => {
         takeProfitPrice: state.takeProfitPrice, stopLossPrice: state.stopLossPrice, purchasedQty: state.purchasedQty,
       },
       statsToday: {
-        trades: `${state.tradesToday}/${DEFAULTS.MAX_TRADES_PER_DAY}`,
+        trades: state.tradesToday,
         wins: state.winsToday, losses: state.lossesToday,
         consecutiveLosses: state.consecutiveLosses, dailyPnlUsdt: state.dailyPnlUsdt,
       },
@@ -648,14 +685,12 @@ app.post('/api/admin/config', requireAdminAuth, async (req, res) => {
       const amt = Number(tradeAmountUsdt);
       if (!Number.isFinite(amt) || amt < 5) return res.status(400).json({ error: 'tradeAmountUsdt must be a number >= 5.' });
       state.tradeAmountUsdt = Number(amt.toFixed(2));
+      // UPDATED: Daily loss sets itself from Total Amount - you don't set it manually anymore
+      state.maxDailyLossUsdt = calcDailyLossFromAmount(state.tradeAmountUsdt);
     }
-    if (maxDailyLossUsdt !== undefined) {
-      const cap = Number(maxDailyLossUsdt);
-      if (!Number.isFinite(cap) || cap <= 0) return res.status(400).json({ error: 'maxDailyLossUsdt must be a positive number.' });
-      state.maxDailyLossUsdt = Number(cap.toFixed(2));
-    }
+    // UPDATED: maxDailyLossUsdt in request is IGNORED - it is auto-calculated. Kept for backward compat, does not override.
     if (requireBounceTick !== undefined) state.requireBounceTick = Boolean(requireBounceTick);
-    addLog(`Admin updated config: tradeAmountUsdt=$${state.tradeAmountUsdt}, maxDailyLossUsdt=$${state.maxDailyLossUsdt}, requireBounceTick=${state.requireBounceTick}`);
+    addLog(`Admin updated config: tradeAmountUsdt=$${state.tradeAmountUsdt}, AUTO maxDailyLossUsdt=$${state.maxDailyLossUsdt}, requireBounceTick=${state.requireBounceTick}`);
     await saveStateToDb();
     res.json({ message: 'Configuration updated', tradeAmountUsdt: state.tradeAmountUsdt, maxDailyLossUsdt: state.maxDailyLossUsdt, requireBounceTick: state.requireBounceTick });
   } catch (err) { res.status(500).json({ error: err.message }); }
