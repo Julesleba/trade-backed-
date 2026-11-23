@@ -23,7 +23,8 @@ app.use(
 // ==========================================
 const DEFAULTS = {
   SYMBOL: 'SOLUSDT',
-  TRADE_AMOUNT_USDT: 5.5,        // Above $5 Binance spot minimum
+  TRADE_AMOUNT_USDT: 5.5,        // Fallback only - live uses dynamic balance
+  MIN_TRADE_USDT: 5.10,          // Must stay above Binance $5.00 minimum
   BUY_DIP_PERCENT: 0.02,         // -2.0% dip from referencePrice
   TAKE_PROFIT_PERCENT: 0.05,     // +5.0% hard take-profit fallback
   STOP_LOSS_PERCENT: 0.03,       // -3.0% hard stop-loss
@@ -33,13 +34,12 @@ const DEFAULTS = {
   PRICE_WINDOW_SIZE: 20,         // Rolling price samples for context
   FEE_RATE_PER_SIDE: 0.001,      // ~0.1% spot fee estimate per side
   MAX_TRADES_PER_DAY: 5,
-  MAX_CONSECUTIVE_LOSSES: 3,
-  MAX_DAILY_LOSS_USDT: 3.0,      // Stop new entries if daily PnL <= -$3.00
+  MAX_CONSECUTIVE_LOSSES: 2,     // UPDATED: was 3 -> 2 for live
+  MAX_DAILY_LOSS_USDT: 0.45,     // UPDATED: was 3.0 -> 0.45 to keep balance above $5.00
   COOLDOWN_MINUTES: 30,
   POLL_INTERVAL_MS: 60 * 1000,
   TIMEZONE: 'Africa/Lagos',
-  ACTIVE_START_HOUR: 7,          // 07:00 AM WAT
-  ACTIVE_END_HOUR: 22,           // 10:00 PM WAT
+  // REMOVED: ACTIVE_START_HOUR / ACTIVE_END_HOUR - now True 24/7
 };
 
 // ==========================================
@@ -55,16 +55,14 @@ const db = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// FIX 1: Env fix - supports both BINANCE_TESTNET and USE_TESTNET
 const USE_BINANCE_TESTNET = (process.env.BINANCE_TESTNET ?? process.env.USE_TESTNET ?? 'true') !== 'false';
 const BINANCE_BASE_URL = USE_BINANCE_TESTNET
   ? 'https://testnet.binance.vision/api'
-  : 'https://api.binance.com/api'; //
+  : 'https://api.binance.com/api';
 
 const BINANCE_API_KEY = process.env.BINANCE_API_KEY || '';
 const BINANCE_API_SECRET = process.env.BINANCE_API_SECRET || '';
 
-// FIX BUG 1: Binance server time offset - fixes -1021 timestamp error on Render
 let binanceTimeOffset = 0;
 
 async function binancePublicRequest(path, params = {}) {
@@ -93,18 +91,12 @@ function signBinanceParams(params = {}) {
   if (!BINANCE_API_KEY || !BINANCE_API_SECRET) {
     throw new Error('Missing BINANCE_API_KEY or BINANCE_API_SECRET in environment variables.');
   }
-  // FIX BUG 1: use Binance server time + recvWindow
   const query = new URLSearchParams({
     ...params,
     recvWindow: '5000',
     timestamp: (Date.now() + binanceTimeOffset).toString(),
   }).toString();
-
-  const signature = crypto
-    .createHmac('sha256', BINANCE_API_SECRET)
-    .update(query)
-    .digest('hex');
-
+  const signature = crypto.createHmac('sha256', BINANCE_API_SECRET).update(query).digest('hex');
   return `${query}&signature=${signature}`;
 }
 
@@ -113,9 +105,7 @@ async function binanceSignedRequest(method, path, params = {}) {
   const url = `${BINANCE_BASE_URL}${path}?${signedQs}`;
   const res = await fetch(url, {
     method,
-    headers: {
-      'X-MBX-APIKEY': BINANCE_API_KEY,
-    },
+    headers: { 'X-MBX-APIKEY': BINANCE_API_KEY },
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.code) {
@@ -164,7 +154,6 @@ async function initDatabase() {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
-
   await db.query(`
     CREATE TABLE IF NOT EXISTS trade_journal (
       id SERIAL PRIMARY KEY,
@@ -179,8 +168,6 @@ async function initDatabase() {
       closed_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
-
-  // MERGE 2: bot_logs table from my version - logs survive restarts
   await db.query(`
     CREATE TABLE IF NOT EXISTS bot_logs (
       id SERIAL PRIMARY KEY,
@@ -188,12 +175,13 @@ async function initDatabase() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
-
   const res = await db.query('SELECT data FROM bot_state WHERE id = 1');
   if (res.rows.length > 0 && res.rows[0].data) {
     state = {
       ...state,
       ...res.rows[0].data,
+      // Force live safety values even if old DB has old 3.0 / 3 losses saved
+      maxDailyLossUsdt: DEFAULTS.MAX_DAILY_LOSS_USDT,
       logs: Array.isArray(res.rows[0].data.logs) ? res.rows[0].data.logs.slice(0, 100) : [],
       priceHistory: Array.isArray(res.rows[0].data.priceHistory)
         ? res.rows[0].data.priceHistory.slice(-DEFAULTS.PRICE_WINDOW_SIZE)
@@ -207,12 +195,8 @@ async function initDatabase() {
 async function saveStateToDb() {
   try {
     await db.query(
-      `
-      INSERT INTO bot_state (id, data, updated_at)
-      VALUES (1, $1::jsonb, NOW())
-      ON CONFLICT (id)
-      DO UPDATE SET data = EXCLUDED.data, updated_at = NOW();
-      `,
+      `INSERT INTO bot_state (id, data, updated_at) VALUES (1, $1::jsonb, NOW())
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW();`,
       [JSON.stringify(state)]
     );
   } catch (err) {
@@ -223,22 +207,10 @@ async function saveStateToDb() {
 async function insertTradeToDb(record) {
   try {
     await db.query(
-      `
-      INSERT INTO trade_journal
+      `INSERT INTO trade_journal
         (trade_number, trade_date, entry_price, exit_price, qty, pnl_usdt, outcome, reason, closed_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
-      `,
-      [
-        record.tradeNumber,
-        record.date,
-        record.entryPrice,
-        record.exitPrice,
-        record.qty,
-        record.pnlUsdt,
-        record.outcome,
-        record.reason,
-        record.closedAt,
-      ]
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);`,
+      [record.tradeNumber, record.date, record.entryPrice, record.exitPrice, record.qty, record.pnlUsdt, record.outcome, record.reason, record.closedAt]
     );
   } catch (err) {
     console.error('Failed inserting trade to Neon DB:', err.message);
@@ -247,25 +219,72 @@ async function insertTradeToDb(record) {
 
 async function getRecentTradesFromDb(limit = 50) {
   const res = await db.query(
-    `
-    SELECT
-      id,
-      trade_number AS "tradeNumber",
-      trade_date AS "date",
-      entry_price AS "entryPrice",
-      exit_price AS "exitPrice",
-      qty,
-      pnl_usdt AS "pnlUsdt",
-      outcome,
-      reason,
-      closed_at AS "closedAt"
-    FROM trade_journal
-    ORDER BY id DESC
-    LIMIT $1;
-    `,
+    `SELECT id, trade_number AS "tradeNumber", trade_date AS "date", entry_price AS "entryPrice",
+      exit_price AS "exitPrice", qty, pnl_usdt AS "pnlUsdt", outcome, reason, closed_at AS "closedAt"
+     FROM trade_journal ORDER BY id DESC LIMIT $1;`,
     [limit]
   );
   return res.rows;
+}
+
+// NEW: Daily + Weekly report helpers - reads from trade_journal, does not touch trading logic
+async function getDailyReport(dateStr) {
+  const res = await db.query(
+    `SELECT COUNT(*)::int AS trades, COALESCE(SUM(pnl_usdt),0)::float AS total_pnl,
+      COALESCE(SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END),0)::int AS wins,
+      COALESCE(SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END),0)::int AS losses,
+      COALESCE(SUM(CASE WHEN pnl_usdt>0 THEN pnl_usdt ELSE 0 END),0)::float AS gross_win,
+      COALESCE(SUM(CASE WHEN pnl_usdt<0 THEN pnl_usdt ELSE 0 END),0)::float AS gross_loss
+     FROM trade_journal WHERE trade_date = $1;`,
+    [dateStr]
+  );
+  const r = res.rows[0];
+  return {
+    date: dateStr,
+    trades: r.trades,
+    wins: r.wins,
+    losses: r.losses,
+    winRate: r.trades ? Number(((r.wins / r.trades) * 100).toFixed(1)) : 0,
+    totalPnlUsdt: Number(r.total_pnl.toFixed(4)),
+    grossWin: Number(r.gross_win.toFixed(4)),
+    grossLoss: Number(r.gross_loss.toFixed(4)),
+    verdict: r.total_pnl > 0 ? 'WIN DAY' : r.total_pnl < 0 ? 'LOSS DAY' : 'NO TRADES / BREAKEVEN',
+  };
+}
+
+async function getWeeklyReport() {
+  // Last 7 days in Lagos time (trade_date is YYYY-MM-DD)
+  const res = await db.query(
+    `SELECT trade_date AS date, COUNT(*)::int AS trades,
+      COALESCE(SUM(pnl_usdt),0)::float AS total_pnl,
+      COALESCE(SUM(CASE WHEN outcome='WIN' THEN 1 ELSE 0 END),0)::int AS wins,
+      COALESCE(SUM(CASE WHEN outcome='LOSS' THEN 1 ELSE 0 END),0)::int AS losses
+     FROM trade_journal
+     WHERE trade_date >= TO_CHAR((NOW() AT TIME ZONE 'Africa/Lagos') - INTERVAL '6 days', 'YYYY-MM-DD')
+     GROUP BY trade_date ORDER BY trade_date ASC;`
+  );
+  const days = res.rows.map((d) => ({
+    date: d.date,
+    trades: d.trades,
+    wins: d.wins,
+    losses: d.losses,
+    totalPnlUsdt: Number(d.total_pnl.toFixed(4)),
+  }));
+  const totalPnl = days.reduce((a, d) => a + d.totalPnlUsdt, 0);
+  const totalTrades = days.reduce((a, d) => a + d.trades, 0);
+  const totalWins = days.reduce((a, d) => a + d.wins, 0);
+  return {
+    period: 'Last 7 Days',
+    days,
+    summary: {
+      totalTrades,
+      totalWins,
+      totalLosses: totalTrades - totalWins,
+      winRate: totalTrades ? Number(((totalWins / totalTrades) * 100).toFixed(1)) : 0,
+      totalPnlUsdt: Number(totalPnl.toFixed(4)),
+      verdict: totalPnl > 0 ? 'WIN WEEK' : totalPnl < 0 ? 'LOSS WEEK' : 'BREAKEVEN WEEK',
+    },
+  };
 }
 
 // ==========================================
@@ -277,18 +296,13 @@ function addLog(message) {
   console.log(entry);
   state.logs.unshift(entry);
   if (state.logs.length > 100) state.logs.pop();
-  // MERGE 2: Save log to Neon - fire and forget, does not block trading logic
   db.query('INSERT INTO bot_logs (message) VALUES ($1)', [entry]).catch(() => {});
 }
 
 function getLagosTimeInfo() {
   const now = new Date();
   const dateStr = now.toLocaleDateString('en-CA', { timeZone: DEFAULTS.TIMEZONE });
-  const hourStr = now.toLocaleTimeString('en-GB', {
-    timeZone: DEFAULTS.TIMEZONE,
-    hour: '2-digit',
-    hour12: false,
-  });
+  const hourStr = now.toLocaleTimeString('en-GB', { timeZone: DEFAULTS.TIMEZONE, hour: '2-digit', hour12: false });
   return { dateStr, hour: parseInt(hourStr, 10) };
 }
 
@@ -299,6 +313,13 @@ function getRollingAverage(prices) {
 }
 
 async function resetDailyStats(newDateStr) {
+  // NEW: Before wiping, log yesterday's total win/loss report
+  if (state.currentDate) {
+    try {
+      const y = await getDailyReport(state.currentDate);
+      addLog(`DAILY REPORT ${y.date} | Trades: ${y.trades} | Wins: ${y.wins} | Losses: ${y.losses} | Total PnL: $${y.totalPnlUsdt} | ${y.verdict}`);
+    } catch (e) { /* report is extra, never block reset */ }
+  }
   state.currentDate = newDateStr;
   state.referencePrice = null;
   state.buyTargetPrice = null;
@@ -315,153 +336,135 @@ async function resetDailyStats(newDateStr) {
 async function setReferencePrice(price) {
   state.referencePrice = price;
   state.buyTargetPrice = Number((price * (1 - DEFAULTS.BUY_DIP_PERCENT)).toFixed(4));
-  addLog(
-    `Reference price set to $${price.toFixed(4)} | Buy Target (-2%): $${state.buyTargetPrice}`
-  );
+  addLog(`Reference price set to $${price.toFixed(4)} | Buy Target (-2%): $${state.buyTargetPrice}`);
   await saveStateToDb();
+}
+
+// NEW: Update trailing reference upward only - never down, only when not in position
+async function updateTrailingReference(livePrice) {
+  if (state.inPosition) return;
+  if (!state.referencePrice) return;
+  if (livePrice > state.referencePrice) {
+    state.referencePrice = livePrice;
+    state.buyTargetPrice = Number((livePrice * (1 - DEFAULTS.BUY_DIP_PERCENT)).toFixed(4));
+    addLog(`Trailing UP: Reference $${state.referencePrice.toFixed(4)} | New Buy Target: $${state.buyTargetPrice}`);
+    await saveStateToDb();
+  }
 }
 
 // ==========================================
 // 6. BINANCE EXCHANGE FUNCTIONS
 // ==========================================
 async function fetchLivePrice() {
-  const data = await binancePublicRequest('/v3/ticker/price', {
-    symbol: DEFAULTS.SYMBOL,
-  }); //
+  const data = await binancePublicRequest('/v3/ticker/price', { symbol: DEFAULTS.SYMBOL });
   const price = parseFloat(data.price);
-  if (!Number.isFinite(price) || price <= 0) {
-    throw new Error('Ticker fetch failed: invalid price');
-  }
+  if (!Number.isFinite(price) || price <= 0) throw new Error('Ticker fetch failed: invalid price');
   return price;
 }
 
 async function getSolAvailableBalance() {
   const data = await binanceSignedRequest('GET', '/v3/account');
-  const assetInfo = Array.isArray(data.balances)
-    ? data.balances.find((b) => b.asset === 'SOL')
-    : null;
+  const assetInfo = Array.isArray(data.balances) ? data.balances.find((b) => b.asset === 'SOL') : null;
+  return assetInfo ? parseFloat(assetInfo.free) : 0;
+}
+
+// NEW: Dynamic USDT - real free balance before every BUY
+async function getUsdtAvailableBalance() {
+  const data = await binanceSignedRequest('GET', '/v3/account');
+  const assetInfo = Array.isArray(data.balances) ? data.balances.find((b) => b.asset === 'USDT') : null;
   return assetInfo ? parseFloat(assetInfo.free) : 0;
 }
 
 async function executeMarketBuy(currentPrice) {
-  const amountUsdt = Number(state.tradeAmountUsdt);
-  if (!Number.isFinite(amountUsdt) || amountUsdt < 5) {
-    throw new Error(`Invalid tradeAmountUsdt (${amountUsdt}).Must be at least $5.`);
+  // NEW: Dynamic sizing - use real balance, not hardcoded 5.5
+  const freeUsdt = await getUsdtAvailableBalance();
+  if (freeUsdt < DEFAULTS.MIN_TRADE_USDT) {
+    throw new Error(`Insufficient USDT: free $${freeUsdt.toFixed(2)} < minimum $${DEFAULTS.MIN_TRADE_USDT}. Skipping buy.`);
   }
+  const amountUsdt = Number((freeUsdt * 0.99).toFixed(2));
+  state.tradeAmountUsdt = amountUsdt; // save for dashboard / compounding
 
-  addLog(`Dip + bounce confirmed! Buying $${amountUsdt} of ${DEFAULTS.SYMBOL} @ $${currentPrice.toFixed(4)}...`);
+  addLog(`Dip + bounce confirmed! Buying $${amountUsdt} of ${DEFAULTS.SYMBOL} @ ~$${currentPrice.toFixed(4)} (Free USDT: $${freeUsdt.toFixed(2)})...`);
 
-  // FIX 2: Snapshot balance BEFORE buy, so we only count what bot bought
   const solBalBefore = await getSolAvailableBalance();
 
-  await binanceSignedRequest('POST', '/v3/order', {
+  // NEW: Capture Binance order receipt to get ACTUAL fill price
+  const order = await binanceSignedRequest('POST', '/v3/order', {
     symbol: DEFAULTS.SYMBOL,
     side: 'BUY',
     type: 'MARKET',
     quoteOrderQty: amountUsdt.toFixed(2),
-  }); //
+  });
 
   await new Promise((r) => setTimeout(r, 2000));
   const solBalAfter = await getSolAvailableBalance();
-  // FIX 2 + BUG 3: only the delta, floored to 0.001 step
   const sellableQty = Math.floor((solBalAfter - solBalBefore) * 1000) / 1000;
+  if (sellableQty <= 0) throw new Error('Buy settled with 0 sellable SOL quantity (check minimum precision/balance).');
 
-  if (sellableQty <= 0) {
-    throw new Error('Buy settled with 0 sellable SOL quantity (check minimum precision/balance).');
-  }
+  // NEW: Actual fill = cummulativeQuoteQty / executedQty, fallback to ticker if Binance returns 0
+  let actualEntryPrice = currentPrice;
+  const execQty = parseFloat(order.executedQty || '0');
+  const cumQuote = parseFloat(order.cummulativeQuoteQty || '0');
+  if (execQty > 0 && cumQuote > 0) actualEntryPrice = cumQuote / execQty;
 
   state.inPosition = true;
-  state.entryPrice = currentPrice;
-  state.highestPriceSinceEntry = currentPrice;
+  state.entryPrice = Number(actualEntryPrice.toFixed(4));
+  state.highestPriceSinceEntry = state.entryPrice;
   state.trailingActive = false;
   state.purchasedQty = sellableQty;
-  state.takeProfitPrice = Number((currentPrice * (1 + DEFAULTS.TAKE_PROFIT_PERCENT)).toFixed(4));
-  state.stopLossPrice = Number((currentPrice * (1 - DEFAULTS.STOP_LOSS_PERCENT)).toFixed(4));
+  state.takeProfitPrice = Number((state.entryPrice * (1 + DEFAULTS.TAKE_PROFIT_PERCENT)).toFixed(4));
+  state.stopLossPrice = Number((state.entryPrice * (1 - DEFAULTS.STOP_LOSS_PERCENT)).toFixed(4));
 
-  addLog(
-    `BOUGHT ${sellableQty} SOL @ $${currentPrice.toFixed(4)} | Trail Start (+${(
-      DEFAULTS.TRAIL_START_PERCENT * 100
-    ).toFixed(1)}%) | Hard TP: $${state.takeProfitPrice} | SL: $${state.stopLossPrice}`
-  );
-
+  addLog(`BOUGHT ${sellableQty} SOL @ ACTUAL $${state.entryPrice.toFixed(4)} (ticker was $${currentPrice.toFixed(4)}) | Trail Start (+${(DEFAULTS.TRAIL_START_PERCENT * 100).toFixed(1)}%) | Hard TP: $${state.takeProfitPrice} | SL: $${state.stopLossPrice}`);
   await saveStateToDb();
 }
 
 async function executeMarketSell(currentPrice, reason) {
-  addLog(`Closing position (${reason}) at $${currentPrice.toFixed(4)}...`);
-
-  // FIX 2: Sell ONLY what bot bought, not whole wallet. Cap by balance for safety.
+  addLog(`Closing position (${reason}) at ~$${currentPrice.toFixed(4)}...`);
   const solBal = await getSolAvailableBalance();
   const qtyToSell = Math.floor(Math.min(state.purchasedQty || 0, solBal) * 1000) / 1000;
-
   if (qtyToSell <= 0) {
     addLog('Warning: No SOL balance found to sell. Resetting position state.');
-    state.inPosition = false;
-    state.entryPrice = null;
-    state.highestPriceSinceEntry = null;
-    state.trailingActive = false;
-    state.takeProfitPrice = null;
-    state.stopLossPrice = null;
-    state.purchasedQty = 0;
+    state.inPosition = false; state.entryPrice = null; state.highestPriceSinceEntry = null;
+    state.trailingActive = false; state.takeProfitPrice = null; state.stopLossPrice = null; state.purchasedQty = 0;
     await saveStateToDb();
     return;
   }
 
-  await binanceSignedRequest('POST', '/v3/order', {
-    symbol: DEFAULTS.SYMBOL,
-    side: 'SELL',
-    type: 'MARKET',
-    quantity: qtyToSell.toString(),
-  }); //
+  const order = await binanceSignedRequest('POST', '/v3/order', {
+    symbol: DEFAULTS.SYMBOL, side: 'SELL', type: 'MARKET', quantity: qtyToSell.toString(),
+  });
 
-  const entryRef = state.entryPrice || currentPrice;
-  const grossPnl = (currentPrice - entryRef) * qtyToSell;
-  const estimatedFees =
-    (entryRef * qtyToSell + currentPrice * qtyToSell) * DEFAULTS.FEE_RATE_PER_SIDE;
+  // NEW: Actual sell fill price from receipt
+  let actualExitPrice = currentPrice;
+  const execQty = parseFloat(order.executedQty || '0');
+  const cumQuote = parseFloat(order.cummulativeQuoteQty || '0');
+  if (execQty > 0 && cumQuote > 0) actualExitPrice = cumQuote / execQty;
+  actualExitPrice = Number(actualExitPrice.toFixed(4));
+
+  const entryRef = state.entryPrice || actualExitPrice;
+  const grossPnl = (actualExitPrice - entryRef) * qtyToSell;
+  const estimatedFees = (entryRef * qtyToSell + actualExitPrice * qtyToSell) * DEFAULTS.FEE_RATE_PER_SIDE;
   const netPnl = Number((grossPnl - estimatedFees).toFixed(4));
   const isWin = netPnl >= 0;
 
   state.tradesToday += 1;
   state.dailyPnlUsdt = Number((state.dailyPnlUsdt + netPnl).toFixed(4));
-
-  if (isWin) {
-    state.winsToday += 1;
-    state.consecutiveLosses = 0;
-  } else {
-    state.lossesToday += 1;
-    state.consecutiveLosses += 1;
-  }
+  if (isWin) { state.winsToday += 1; state.consecutiveLosses = 0; }
+  else { state.lossesToday += 1; state.consecutiveLosses += 1; }
 
   const record = {
-    tradeNumber: state.tradesToday,
-    date: state.currentDate,
-    entryPrice: entryRef,
-    exitPrice: currentPrice,
-    qty: qtyToSell,
-    pnlUsdt: netPnl,
-    outcome: isWin ? 'WIN' : 'LOSS',
-    reason,
-    closedAt: new Date().toISOString(),
+    tradeNumber: state.tradesToday, date: state.currentDate, entryPrice: entryRef,
+    exitPrice: actualExitPrice, qty: qtyToSell, pnlUsdt: netPnl,
+    outcome: isWin ? 'WIN' : 'LOSS', reason, closedAt: new Date().toISOString(),
   };
-
   await insertTradeToDb(record);
+  addLog(`SOLD ${qtyToSell} SOL @ ACTUAL $${actualExitPrice.toFixed(4)} | ${record.outcome} ($${netPnl} net) | Daily PnL: $${state.dailyPnlUsdt}`);
 
-  addLog(
-    `SOLD ${qtyToSell} SOL @ $${currentPrice.toFixed(4)} | ${record.outcome} ($${netPnl} net) | Daily PnL: $${state.dailyPnlUsdt}`
-  );
-
-  state.inPosition = false;
-  state.entryPrice = null;
-  state.highestPriceSinceEntry = null;
-  state.trailingActive = false;
-  state.takeProfitPrice = null;
-  state.stopLossPrice = null;
-  state.purchasedQty = 0;
-
-  state.referencePrice = null;
-  state.buyTargetPrice = null;
+  state.inPosition = false; state.entryPrice = null; state.highestPriceSinceEntry = null;
+  state.trailingActive = false; state.takeProfitPrice = null; state.stopLossPrice = null; state.purchasedQty = 0;
+  state.referencePrice = null; state.buyTargetPrice = null;
   state.cooldownUntil = Date.now() + DEFAULTS.COOLDOWN_MINUTES * 60 * 1000;
-
   addLog(`Cooldown active for ${DEFAULTS.COOLDOWN_MINUTES}m. Reference price resets afterward.`);
   await saveStateToDb();
 }
@@ -471,101 +474,63 @@ async function executeMarketSell(currentPrice, reason) {
 // ==========================================
 async function runTradingCycle() {
   if (!state.isRunning) return;
-
   try {
-    const { dateStr, hour } = getLagosTimeInfo();
-
-    if (state.currentDate !== dateStr) {
-      await resetDailyStats(dateStr);
-    }
+    const { dateStr } = getLagosTimeInfo();
+    if (state.currentDate !== dateStr) await resetDailyStats(dateStr);
 
     const prevPrice = state.lastPrice;
     const livePrice = await fetchLivePrice();
     state.lastPrice = livePrice;
-
     state.priceHistory.push(livePrice);
-    if (state.priceHistory.length > DEFAULTS.PRICE_WINDOW_SIZE) {
-      state.priceHistory.shift();
-    }
+    if (state.priceHistory.length > DEFAULTS.PRICE_WINDOW_SIZE) state.priceHistory.shift();
 
-    // 1. OPEN POSITION MANAGEMENT (Trailing TP + Hard TP + Hard SL)
+    // 1. OPEN POSITION MANAGEMENT (Trailing TP + Hard TP + Hard SL) - UNTOUCHED LOGIC
     if (state.inPosition && state.entryPrice) {
-      if (
-        state.highestPriceSinceEntry === null ||
-        livePrice > state.highestPriceSinceEntry
-      ) {
+      if (state.highestPriceSinceEntry === null || livePrice > state.highestPriceSinceEntry) {
         state.highestPriceSinceEntry = livePrice;
       }
-
       const trailActivationPrice = state.entryPrice * (1 + DEFAULTS.TRAIL_START_PERCENT);
-      if (livePrice >= trailActivationPrice) {
-        state.trailingActive = true;
-      }
-
+      if (livePrice >= trailActivationPrice) state.trailingActive = true;
       const trailingStopPrice = state.trailingActive
         ? Number((state.highestPriceSinceEntry * (1 - DEFAULTS.TRAIL_PULLBACK_PERCENT)).toFixed(4))
         : null;
-
       if (trailingStopPrice !== null && livePrice <= trailingStopPrice) {
-        await executeMarketSell(
-          livePrice,
-          `TRAILING_TP (peak $${state.highestPriceSinceEntry.toFixed(4)}, pull -${(
-            DEFAULTS.TRAIL_PULLBACK_PERCENT * 100
-          ).toFixed(1)}%)`
-        );
+        await executeMarketSell(livePrice, `TRAILING_TP (peak $${state.highestPriceSinceEntry.toFixed(4)}, pull -${(DEFAULTS.TRAIL_PULLBACK_PERCENT * 100).toFixed(1)}%)`);
       } else if (livePrice >= state.takeProfitPrice) {
         await executeMarketSell(livePrice, 'HARD_TAKE_PROFIT (+5%)');
       } else if (livePrice <= state.stopLossPrice) {
         await executeMarketSell(livePrice, 'STOP_LOSS (-3%)');
       } else {
-        const trailInfo = trailingStopPrice
-          ? ` | Trail Stop: $${trailingStopPrice}`
-          : ` | Trail Starts @ $${trailActivationPrice.toFixed(4)}`;
-        addLog(
-          `Holding SOL | Now: $${livePrice.toFixed(4)} | Peak: $${state.highestPriceSinceEntry.toFixed(
-            4
-          )}${trailInfo} | Hard SL: $${state.stopLossPrice}`
-        );
+        const trailInfo = trailingStopPrice ? ` | Trail Stop: $${trailingStopPrice}` : ` | Trail Starts @ $${trailActivationPrice.toFixed(4)}`;
+        addLog(`Holding SOL | Now: $${livePrice.toFixed(4)} | Peak: $${state.highestPriceSinceEntry.toFixed(4)}${trailInfo} | Hard SL: $${state.stopLossPrice}`);
       }
-
       await saveStateToDb();
       return;
     }
 
-    // 2. DAILY CIRCUIT BREAKERS
-    if (state.tradesToday >= DEFAULTS.MAX_TRADES_PER_DAY) {
-      return;
-    }
+    // 2. DAILY CIRCUIT BREAKERS - UNTOUCHED LOGIC, NEW LIMITS FROM DEFAULTS
+    if (state.tradesToday >= DEFAULTS.MAX_TRADES_PER_DAY) return;
+    if (state.consecutiveLosses >= DEFAULTS.MAX_CONSECUTIVE_LOSSES) return; // now 2
+    if (state.dailyPnlUsdt <= -Math.abs(Number(state.maxDailyLossUsdt))) return; // now -0.45
 
-    if (state.consecutiveLosses >= DEFAULTS.MAX_CONSECUTIVE_LOSSES) {
-      return;
-    }
+    // 3. REMOVED: ACTIVE WAT HOURS CHECK - Now True 24/7
 
-    if (state.dailyPnlUsdt <= -Math.abs(Number(state.maxDailyLossUsdt))) {
-      return;
-    }
+    // 4. COOLDOWN CHECK - UNTOUCHED
+    if (state.cooldownUntil && Date.now() < state.cooldownUntil) return;
 
-    // 3. ACTIVE WAT HOURS CHECK
-    if (hour < DEFAULTS.ACTIVE_START_HOUR || hour >= DEFAULTS.ACTIVE_END_HOUR) {
-      return;
-    }
-
-    // 4. COOLDOWN CHECK
-    if (state.cooldownUntil && Date.now() < state.cooldownUntil) {
-      return;
-    }
-
-    // 5. SET MORNING OR POST-COOLDOWN REFERENCE ANCHOR
+    // 5. SET MORNING OR POST-COOLDOWN REFERENCE ANCHOR - UNTOUCHED
     if (!state.referencePrice) {
       state.cooldownUntil = null;
       await setReferencePrice(livePrice);
       return;
     }
 
-    // 6. DIP + BOUNCE BUY TRIGGER
+    // 5b. NEW: TRAILING REFERENCE UPWARD - only when not in position
+    await updateTrailingReference(livePrice);
+
+    // 6. DIP + BOUNCE BUY TRIGGER - UNTOUCHED LOGIC
     const dipReached = livePrice <= state.buyTargetPrice;
     const bounceConfirmed = !state.requireBounceTick || prevPrice === null || livePrice > prevPrice;
-
     if (dipReached && bounceConfirmed) {
       await executeMarketBuy(livePrice);
     } else {
@@ -578,30 +543,20 @@ async function runTradingCycle() {
 }
 
 // ==========================================
-// 8. ROUTES (PUBLIC HEALTH + PROTECTED ADMIN API)
+// 8. ROUTES
 // ==========================================
 function requireAdminAuth(req, res, next) {
   const secret = process.env.ADMIN_SECRET;
-  if (!secret) {
-    return res.status(500).json({ error: 'ADMIN_SECRET is not configured on the server.' });
-  }
-
+  if (!secret) return res.status(500).json({ error: 'ADMIN_SECRET is not configured on the server.' });
   const headerSecret = req.headers['x-admin-secret'] || req.headers['x-admin-key'];
   const authHeader = req.headers['authorization'];
-  const bearerToken =
-    authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
-  // MERGE 5: Allow ?key= for iPhone Safari - no header needed
+  const bearerToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
   const queryKey = req.query.key || req.query.adminKey;
-
   const provided = headerSecret || bearerToken || queryKey;
-  if (!provided || provided !== secret) {
-    return res.status(401).json({ error: 'Unauthorized: invalid or missing admin secret.' });
-  }
-
+  if (!provided || provided !== secret) return res.status(401).json({ error: 'Unauthorized: invalid or missing admin secret.' });
   next();
 }
 
-// MERGE 1: Full public status - for Render, UptimeRobot & quick iPhone check
 app.get('/', (req, res) => {
   res.json({
     service: 'SOL/USDT Spot Bot Backend',
@@ -618,18 +573,17 @@ app.get('/', (req, res) => {
     trailingActive: state.trailingActive,
     statsToday: {
       trades: `${state.tradesToday}/${DEFAULTS.MAX_TRADES_PER_DAY}`,
-      wins: state.winsToday,
-      losses: state.lossesToday,
-      consecutiveLosses: state.consecutiveLosses,
-      dailyPnlUsdt: state.dailyPnlUsdt,
+      wins: state.winsToday, losses: state.lossesToday,
+      consecutiveLosses: state.consecutiveLosses, dailyPnlUsdt: state.dailyPnlUsdt,
     },
   });
 });
 
-// Full dashboard snapshot for Admin Frontend
 app.get('/api/admin/dashboard', requireAdminAuth, async (req, res) => {
   try {
     const trades = await getRecentTradesFromDb(50);
+    const dailyReport = state.currentDate ? await getDailyReport(state.currentDate) : null;
+    const weeklyReport = await getWeeklyReport();
     res.json({
       network: USE_BINANCE_TESTNET ? 'BINANCE_TESTNET' : 'BINANCE_LIVE',
       status: state.isRunning ? 'RUNNING' : 'PAUSED',
@@ -644,152 +598,108 @@ app.get('/api/admin/dashboard', requireAdminAuth, async (req, res) => {
         stopLossPercent: DEFAULTS.STOP_LOSS_PERCENT,
         maxTradesPerDay: DEFAULTS.MAX_TRADES_PER_DAY,
         maxConsecutiveLosses: DEFAULTS.MAX_CONSECUTIVE_LOSSES,
-        activeHoursWAT: `${DEFAULTS.ACTIVE_START_HOUR}:00 - ${DEFAULTS.ACTIVE_END_HOUR}:00`,
+        activeHoursWAT: '24/7 - No Restriction',
       },
       market: {
-        dateWAT: state.currentDate,
-        lastPrice: state.lastPrice,
+        dateWAT: state.currentDate, lastPrice: state.lastPrice,
         rollingAvg: getRollingAverage(state.priceHistory),
-        referencePrice: state.referencePrice,
-        buyTargetPrice: state.buyTargetPrice,
+        referencePrice: state.referencePrice, buyTargetPrice: state.buyTargetPrice,
         cooldownUntil: state.cooldownUntil,
       },
       position: {
-        inPosition: state.inPosition,
-        entryPrice: state.entryPrice,
-        highestPriceSinceEntry: state.highestPriceSinceEntry,
-        trailingActive: state.trailingActive,
-        takeProfitPrice: state.takeProfitPrice,
-        stopLossPrice: state.stopLossPrice,
-        purchasedQty: state.purchasedQty,
+        inPosition: state.inPosition, entryPrice: state.entryPrice,
+        highestPriceSinceEntry: state.highestPriceSinceEntry, trailingActive: state.trailingActive,
+        takeProfitPrice: state.takeProfitPrice, stopLossPrice: state.stopLossPrice, purchasedQty: state.purchasedQty,
       },
       statsToday: {
         trades: `${state.tradesToday}/${DEFAULTS.MAX_TRADES_PER_DAY}`,
-        wins: state.winsToday,
-        losses: state.lossesToday,
-        consecutiveLosses: state.consecutiveLosses,
-        dailyPnlUsdt: state.dailyPnlUsdt,
+        wins: state.winsToday, losses: state.lossesToday,
+        consecutiveLosses: state.consecutiveLosses, dailyPnlUsdt: state.dailyPnlUsdt,
       },
+      dailyReport,
+      weeklyReport,
       trades,
       logs: state.logs,
     });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Update runtime strategy controls (e.g., increase/decrease tradeAmountUsdt)
+// NEW: Daily report endpoint - total win/loss for a day
+app.get('/api/admin/report/daily', requireAdminAuth, async (req, res) => {
+  try {
+    const date = req.query.date || state.currentDate || getLagosTimeInfo().dateStr;
+    const report = await getDailyReport(date);
+    res.json(report);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// NEW: Weekly report endpoint - total win/loss last 7 days
+app.get('/api/admin/report/weekly', requireAdminAuth, async (req, res) => {
+  try {
+    const report = await getWeeklyReport();
+    res.json(report);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post('/api/admin/config', requireAdminAuth, async (req, res) => {
   try {
     const { tradeAmountUsdt, maxDailyLossUsdt, requireBounceTick } = req.body || {};
-
     if (tradeAmountUsdt !== undefined) {
       const amt = Number(tradeAmountUsdt);
-      if (!Number.isFinite(amt) || amt < 5) {
-        return res.status(400).json({ error: 'tradeAmountUsdt must be a number >= 5.' });
-      }
+      if (!Number.isFinite(amt) || amt < 5) return res.status(400).json({ error: 'tradeAmountUsdt must be a number >= 5.' });
       state.tradeAmountUsdt = Number(amt.toFixed(2));
     }
-
     if (maxDailyLossUsdt !== undefined) {
       const cap = Number(maxDailyLossUsdt);
-      if (!Number.isFinite(cap) || cap <= 0) {
-        return res.status(400).json({ error: 'maxDailyLossUsdt must be a positive number.' });
-      }
+      if (!Number.isFinite(cap) || cap <= 0) return res.status(400).json({ error: 'maxDailyLossUsdt must be a positive number.' });
       state.maxDailyLossUsdt = Number(cap.toFixed(2));
     }
-
-    if (requireBounceTick !== undefined) {
-      state.requireBounceTick = Boolean(requireBounceTick);
-    }
-
-    addLog(
-      `Admin updated config: tradeAmountUsdt=$${state.tradeAmountUsdt}, maxDailyLossUsdt=$${state.maxDailyLossUsdt}, requireBounceTick=${state.requireBounceTick}`
-    );
+    if (requireBounceTick !== undefined) state.requireBounceTick = Boolean(requireBounceTick);
+    addLog(`Admin updated config: tradeAmountUsdt=$${state.tradeAmountUsdt}, maxDailyLossUsdt=$${state.maxDailyLossUsdt}, requireBounceTick=${state.requireBounceTick}`);
     await saveStateToDb();
-
-    res.json({
-      message: 'Configuration updated',
-      tradeAmountUsdt: state.tradeAmountUsdt,
-      maxDailyLossUsdt: state.maxDailyLossUsdt,
-      requireBounceTick: state.requireBounceTick,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    res.json({ message: 'Configuration updated', tradeAmountUsdt: state.tradeAmountUsdt, maxDailyLossUsdt: state.maxDailyLossUsdt, requireBounceTick: state.requireBounceTick });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/admin/pause', requireAdminAuth, async (req, res) => {
-  state.isRunning = false;
-  addLog('Bot PAUSED via Admin Dashboard.');
-  await saveStateToDb();
+  state.isRunning = false; addLog('Bot PAUSED via Admin Dashboard.'); await saveStateToDb();
   res.json({ message: 'Bot paused', isRunning: state.isRunning });
 });
 
 app.post('/api/admin/resume', requireAdminAuth, async (req, res) => {
-  state.isRunning = true;
-  addLog('Bot RESUMED via Admin Dashboard.');
-  await saveStateToDb();
+  state.isRunning = true; addLog('Bot RESUMED via Admin Dashboard.'); await saveStateToDb();
   res.json({ message: 'Bot resumed', isRunning: state.isRunning });
 });
 
 app.post('/api/admin/reset-anchor', requireAdminAuth, async (req, res) => {
   try {
-    if (state.inPosition) {
-      return res.status(400).json({ error: 'Cannot reset anchor while holding an open position.' });
-    }
-    const price = await fetchLivePrice();
-    state.lastPrice = price;
-    await setReferencePrice(price);
-    res.json({
-      message: 'Reference price reset',
-      referencePrice: state.referencePrice,
-      buyTargetPrice: state.buyTargetPrice,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    if (state.inPosition) return res.status(400).json({ error: 'Cannot reset anchor while holding an open position.' });
+    const price = await fetchLivePrice(); state.lastPrice = price; await setReferencePrice(price);
+    res.json({ message: 'Reference price reset', referencePrice: state.referencePrice, buyTargetPrice: state.buyTargetPrice });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/admin/panic-sell', requireAdminAuth, async (req, res) => {
   try {
-    if (!state.inPosition) {
-      return res.status(400).json({ error: 'No open position to close.' });
-    }
-    const price = await fetchLivePrice();
-    state.lastPrice = price;
-    await executeMarketSell(price, 'MANUAL_PANIC_SELL');
+    if (!state.inPosition) return res.status(400).json({ error: 'No open position to close.' });
+    const price = await fetchLivePrice(); state.lastPrice = price; await executeMarketSell(price, 'MANUAL_PANIC_SELL');
     res.json({ message: 'Emergency sell executed', exitPrice: price });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ==========================================
 // 9. STARTUP
 // ==========================================
 const PORT = process.env.PORT || 3000;
-
-// MERGE 4: Don't crash if Neon hiccups - start anyway with in-memory state
 initDatabase()
-  .then(() => {
-    console.log('Neon DB connected');
-  })
-  .catch((err) => {
-    console.error('Database initialization failed, continuing with in-memory state:', err.message);
-  })
+  .then(() => console.log('Neon DB connected'))
+  .catch((err) => console.error('Database initialization failed, continuing with in-memory state:', err.message))
   .finally(() => {
     app.listen(PORT, async () => {
-      addLog(
-        `Server started on port ${PORT} (${
-          USE_BINANCE_TESTNET ? 'BINANCE_TESTNET' : 'BINANCE_LIVE'
-        }) with Neon DB`
-      );
-      // FIX BUG 1: sync time before first trade
+      addLog(`Server started on port ${PORT} (${USE_BINANCE_TESTNET ? 'BINANCE_TESTNET' : 'BINANCE_LIVE'}) with Neon DB`);
       await syncBinanceTime();
       runTradingCycle();
       setInterval(runTradingCycle, DEFAULTS.POLL_INTERVAL_MS);
-      // FIX 3: re-sync Binance time every hour so -1021 never comes back
       setInterval(syncBinanceTime, 60 * 60 * 1000);
     });
   });
