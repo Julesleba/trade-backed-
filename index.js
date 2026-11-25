@@ -31,7 +31,7 @@ const DEFAULTS = {
   TRAIL_START_PERCENT: 0.022,    // UPDATED Sell Fast V3: was 0.025 -> Start trailing once +2.2% above entry
   TRAIL_PULLBACK_PERCENT: 0.005, // UPDATED Sell Fast V3: was 0.012 -> Sell if price pulls back 0.5% from peak
   REQUIRE_BOUNCE_TICK: true,     // Require livePrice > lastPrice on dip trigger
-  PRICE_WINDOW_SIZE: 20,         // Rolling price samples for context
+  PRICE_WINDOW_SIZE: 20,         // Rolling price samples for context - 20 x 30s = 10 MIN TREND WINDOW
   FEE_RATE_PER_SIDE: 0.001,      // ~0.1% spot fee estimate per side
   // UPDATED: MAX_TRADES_PER_DAY REMOVED - No limit, keep going 24/7
   MAX_CONSECUTIVE_LOSSES: 4,     // UPDATED Sell Fast V3: was 2 -> 4 so 1 win can cover 2 losses
@@ -363,16 +363,17 @@ async function updateTrailingReference(livePrice) {
   }
 }
 
-// UPDATED 2026-11-23: TREND FILTER FIX - slice(-6,-1) = last 5 FINISHED days, excludes today's forming candle.
-// Old slice(-5) included today, so price was compared to itself and filter barely blocked.
+// CHANGED 2026-11-25: TREND FILTER = 10-MIN INTRADAY, NOT 5-DAY DAILY.
+// Uses priceHistory (20 polls x 30s = 10 min). Excludes current tick so livePrice is not compared to itself.
+// If <5 samples (just started / after restart), allow buy - don't block on no data.
+// Old 5-day klines code REMOVED - it blocked for days when SOL was $68 vs $70.32 avg.
 async function isUptrend(livePrice) {
   try {
-    const klines = await binancePublicRequest('/v3/klines', { symbol: DEFAULTS.SYMBOL, interval: '1d', limit: 6 });
-    if (!Array.isArray(klines) || klines.length < 6) return true;
-    const closes = klines.slice(-6, -1).map((k) => parseFloat(k[4]));
-    const avg = closes.reduce((a, b) => a + b, 0) / closes.length;
+    const history = (state.priceHistory || []).slice(0, -1).slice(-DEFAULTS.PRICE_WINDOW_SIZE);
+    if (history.length < 5) return true;
+    const avg = history.reduce((a, b) => a + b, 0) / history.length;
     const up = livePrice > avg;
-    if (!up) addLog(`TREND FILTER BLOCKED BUY: Price $${livePrice.toFixed(4)} is BELOW 5-day avg $${avg.toFixed(4)} (downtrend) - Waiting`);
+    if (!up) addLog(`TREND FILTER BLOCKED BUY: Price $${livePrice.toFixed(4)} is BELOW 10m avg $${avg.toFixed(4)} (downtrend last 10m) - Waiting`);
     return up;
   } catch (err) {
     addLog(`Trend check failed (${err.message}) - allowing buy to keep old behaviour`);
@@ -415,7 +416,7 @@ async function executeMarketBuy(currentPrice) {
     throw new Error(`Trade amount $${amountUsdt.toFixed(2)} < minimum $${DEFAULTS.MIN_TRADE_USDT}. Increase Total Amount in dashboard or top up USDT. Free: $${freeUsdt.toFixed(2)} | Dashboard: $${dashboardAmount.toFixed(2)}`);
   }
 
-  addLog(`Dip + bounce + UPTREND confirmed! Buying $${amountUsdt.toFixed(2)} of ${DEFAULTS.SYMBOL} @ ~$${currentPrice.toFixed(4)} (Dashboard: $${dashboardAmount.toFixed(2)} | Free USDT: $${freeUsdt.toFixed(2)})...`);
+  addLog(`Dip + bounce + 10m UPTREND confirmed! Buying $${amountUsdt.toFixed(2)} of ${DEFAULTS.SYMBOL} @ ~$${currentPrice.toFixed(4)} (Dashboard: $${dashboardAmount.toFixed(2)} | Free USDT: $${freeUsdt.toFixed(2)})...`);
 
   const solBalBefore = await getSolAvailableBalance();
 
@@ -502,7 +503,6 @@ async function executeMarketSell(currentPrice, reason) {
   addLog(`Cooldown WATCH active for ${DEFAULTS.COOLDOWN_MINUTES}m. Reference kept at $${state.referencePrice} | Buy Target: $${state.buyTargetPrice} | Watching, not buying.`);
   await saveStateToDb();
 }
-
 // ==========================================
 // 7. MAIN TRADING ENGINE LOOP
 // ==========================================
@@ -574,11 +574,11 @@ async function runTradingCycle() {
     // 5b. NEW: TRAILING REFERENCE UPWARD - only when not in position
     await updateTrailingReference(livePrice);
 
-    // 6. DIP + BOUNCE BUY TRIGGER - UNTOUCHED LOGIC + NEW TREND FILTER CHECK FIRST
+    // 6. DIP + BOUNCE BUY TRIGGER - UNTOUCHED LOGIC + NEW 10m TREND FILTER CHECK FIRST
     const dipReached = livePrice <= state.buyTargetPrice;
     const bounceConfirmed = !state.requireBounceTick || prevPrice === null || livePrice > prevPrice;
     if (dipReached && bounceConfirmed) {
-      // NEW: Don't buy in downtrend - check FIRST before buying
+      // CHANGED: Don't buy in downtrend - 10m intraday check, not 5-day
       const uptrend = await isUptrend(livePrice);
       if (!uptrend) {
         await saveStateToDb();
