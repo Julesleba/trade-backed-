@@ -26,19 +26,19 @@ const DEFAULTS = {
   TRADE_AMOUNT_USDT: 5.5,        // Dashboard Total Amount - bot uses EXACTLY this per trade, NOT 99% of balance
   MIN_TRADE_USDT: 5.10,          // Must stay above Binance $5.00 minimum
   BUY_DIP_PERCENT: 0.02,         // -2.0% dip from referencePrice - UNTOUCHED
-  TAKE_PROFIT_PERCENT: 0.022,    // UPDATED Sell Fast V3: was 0.05 -> +2.2% hard take-profit fallback
-  STOP_LOSS_PERCENT: 0.008,      // UPDATED Sell Fast V3: was 0.03 -> -0.8% hard stop-loss
-  TRAIL_START_PERCENT: 0.022,    // UPDATED Sell Fast V3: was 0.025 -> Start trailing once +2.2% above entry
-  TRAIL_PULLBACK_PERCENT: 0.005, // UPDATED Sell Fast V3: was 0.012 -> Sell if price pulls back 0.5% from peak
+  TAKE_PROFIT_PERCENT: 0.022,    // Sell Fast V3: +2.2% hard take-profit fallback - BACKUP ONLY, trailing should beat it
+  STOP_LOSS_PERCENT: 0.01,       // CHANGED 2026-11-25: was 0.008 -> -1.0% hard stop-loss, more breathing room vs noise
+  TRAIL_START_PERCENT: 0.012,    // CHANGED 2026-11-25: was 0.022 -> Start trailing once +1.2% above entry. FIX: old 2.2% = same as Hard TP, so trailing never woke up. Now 1.2% < 2.2%, trailing has room to run.
+  TRAIL_PULLBACK_PERCENT: 0.005, // UNTOUCHED: Sell if price pulls back 0.5% from peak
   REQUIRE_BOUNCE_TICK: true,     // Require livePrice > lastPrice on dip trigger
   PRICE_WINDOW_SIZE: 20,         // Rolling price samples for context - 20 x 30s = 10 MIN TREND WINDOW
   FEE_RATE_PER_SIDE: 0.001,      // ~0.1% spot fee estimate per side
   // UPDATED: MAX_TRADES_PER_DAY REMOVED - No limit, keep going 24/7
-  MAX_CONSECUTIVE_LOSSES: 4,     // UPDATED Sell Fast V3: was 2 -> 4 so 1 win can cover 2 losses
+  MAX_CONSECUTIVE_LOSSES: 4,     // Sell Fast V3: was 2 -> 4 so 1 win can cover 2 losses
   // UPDATED: Daily loss is AUTO = TRADE_AMOUNT * 0.08. $5.50 -> $0.44, $100 -> $8.00
   DAILY_LOSS_PERCENT_OF_AMOUNT: 0.08,
   MAX_DAILY_LOSS_USDT: 0.44,     // Auto-calculated from TRADE_AMOUNT_USDT, do not set manually
-  COOLDOWN_MINUTES: 5,           // UPDATED Sell Fast V3: was 30 -> 5 min WATCH mode
+  COOLDOWN_MINUTES: 5,           // Sell Fast V3: was 30 -> 5 min WATCH mode
   POLL_INTERVAL_MS: 30 * 1000,   // UPDATED: was 60s -> 30s
   TIMEZONE: 'Africa/Lagos',
   // REMOVED: ACTIVE_START_HOUR / ACTIVE_END_HOUR - now True 24/7
@@ -503,6 +503,7 @@ async function executeMarketSell(currentPrice, reason) {
   addLog(`Cooldown WATCH active for ${DEFAULTS.COOLDOWN_MINUTES}m. Reference kept at $${state.referencePrice} | Buy Target: $${state.buyTargetPrice} | Watching, not buying.`);
   await saveStateToDb();
 }
+
 // ==========================================
 // 7. MAIN TRADING ENGINE LOOP
 // ==========================================
@@ -518,7 +519,7 @@ async function runTradingCycle() {
     state.priceHistory.push(livePrice);
     if (state.priceHistory.length > DEFAULTS.PRICE_WINDOW_SIZE) state.priceHistory.shift();
 
-    // 1. OPEN POSITION MANAGEMENT (Trailing TP + Hard TP + Hard SL) - UNTOUCHED LOGIC, only numbers changed in DEFAULTS
+    // 1. OPEN POSITION MANAGEMENT (Trailing TP + Hard TP + Hard SL) - logic untouched, only numbers in DEFAULTS changed
     if (state.inPosition && state.entryPrice) {
       if (state.highestPriceSinceEntry === null || livePrice > state.highestPriceSinceEntry) {
         state.highestPriceSinceEntry = livePrice;
@@ -533,7 +534,7 @@ async function runTradingCycle() {
       } else if (livePrice >= state.takeProfitPrice) {
         await executeMarketSell(livePrice, 'HARD_TAKE_PROFIT (+2.2%)');
       } else if (livePrice <= state.stopLossPrice) {
-        await executeMarketSell(livePrice, 'STOP_LOSS (-0.8%)');
+        await executeMarketSell(livePrice, 'STOP_LOSS (-1.0%)');
       } else {
         const trailInfo = trailingStopPrice ? ` | Trail Stop: $${trailingStopPrice}` : ` | Trail Starts @ $${trailActivationPrice.toFixed(4)}`;
         addLog(`Holding SOL | Now: $${livePrice.toFixed(4)} | Peak: $${state.highestPriceSinceEntry.toFixed(4)}${trailInfo} | Hard SL: $${state.stopLossPrice}`);
