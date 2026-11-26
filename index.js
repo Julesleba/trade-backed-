@@ -23,25 +23,21 @@ app.use(
 // ==========================================
 const DEFAULTS = {
   SYMBOL: 'SOLUSDT',
-  TRADE_AMOUNT_USDT: 5.5,        // Dashboard Total Amount - bot uses EXACTLY this per trade, NOT 99% of balance
-  MIN_TRADE_USDT: 5.10,          // Must stay above Binance $5.00 minimum
-  // REMOVED: BUY_DIP_PERCENT - No -2% dip anymore
-  TAKE_PROFIT_PERCENT: 0.022,    // Sell Fast V3: +2.2% hard take-profit fallback - BACKUP ONLY, trailing should beat it
-  STOP_LOSS_PERCENT: 0.01,       // CHANGED 2026-11-25: was 0.008 -> -1.0% hard stop-loss, more breathing room vs noise
-  TRAIL_START_PERCENT: 0.012,    // CHANGED 2026-11-25: was 0.022 -> Start trailing once +1.2% above entry. FIX: old 2.2% = same as Hard TP, so trailing never woke up. Now 1.2% < 2.2%, trailing has room to run.
-  TRAIL_PULLBACK_PERCENT: 0.005, // UNTOUCHED: Sell if price pulls back 0.5% from peak
-  REQUIRE_BOUNCE_TICK: true,     // Require livePrice > lastPrice on buy trigger
-  PRICE_WINDOW_SIZE: 20,         // Rolling price samples for context - 20 x 30s = 10 MIN TREND WINDOW
-  FEE_RATE_PER_SIDE: 0.001,      // ~0.1% spot fee estimate per side
-  // UPDATED: MAX_TRADES_PER_DAY REMOVED - No limit, keep going 24/7
-  MAX_CONSECUTIVE_LOSSES: 4,     // Sell Fast V3: was 2 -> 4 so 1 win can cover 2 losses
-  // UPDATED: Daily loss is AUTO = TRADE_AMOUNT * 0.08. $5.50 -> $0.44, $100 -> $8.00
+  TRADE_AMOUNT_USDT: 5.5,
+  MIN_TRADE_USDT: 5.10,
+  TAKE_PROFIT_PERCENT: 0.022,
+  STOP_LOSS_PERCENT: 0.01,
+  TRAIL_START_PERCENT: 0.012,
+  TRAIL_PULLBACK_PERCENT: 0.005,
+  REQUIRE_BOUNCE_TICK: true,
+  PRICE_WINDOW_SIZE: 20,
+  FEE_RATE_PER_SIDE: 0.001,
+  MAX_CONSECUTIVE_LOSSES: 4,
   DAILY_LOSS_PERCENT_OF_AMOUNT: 0.08,
-  MAX_DAILY_LOSS_USDT: 0.44,     // Auto-calculated from TRADE_AMOUNT_USDT, do not set manually
-  COOLDOWN_MINUTES: 5,           // Sell Fast V3: was 30 -> 5 min WATCH mode
-  POLL_INTERVAL_MS: 30 * 1000,   // UPDATED: was 60s -> 30s
+  MAX_DAILY_LOSS_USDT: 0.44,
+  COOLDOWN_MINUTES: 5,
+  POLL_INTERVAL_MS: 30 * 1000,
   TIMEZONE: 'Africa/Lagos',
-  // REMOVED: ACTIVE_START_HOUR / ACTIVE_END_HOUR - now True 24/7
 };
 
 // ==========================================
@@ -145,7 +141,6 @@ let state = {
   logs: [],
 };
 
-// NEW: Helper - Daily loss sets itself from Total Amount in dashboard
 function calcDailyLossFromAmount(amountUsdt) {
   return Number((amountUsdt * DEFAULTS.DAILY_LOSS_PERCENT_OF_AMOUNT).toFixed(2));
 }
@@ -187,7 +182,6 @@ async function initDatabase() {
     state = {
       ...state,
       ...res.rows[0].data,
-      // UPDATED: Auto daily loss from saved tradeAmount, never use old saved 0.45 / 3.0
       tradeAmountUsdt: Number(res.rows[0].data.tradeAmountUsdt || DEFAULTS.TRADE_AMOUNT_USDT),
       maxDailyLossUsdt: calcDailyLossFromAmount(Number(res.rows[0].data.tradeAmountUsdt || DEFAULTS.TRADE_AMOUNT_USDT)),
       logs: Array.isArray(res.rows[0].data.logs) ? res.rows[0].data.logs.slice(0, 100) : [],
@@ -236,7 +230,6 @@ async function getRecentTradesFromDb(limit = 50) {
   return res.rows;
 }
 
-// NEW: Daily + Weekly report helpers - reads from trade_journal, does not touch trading logic
 async function getDailyReport(dateStr) {
   const res = await db.query(
     `SELECT COUNT(*)::int AS trades, COALESCE(SUM(pnl_usdt),0)::float AS total_pnl,
@@ -262,7 +255,6 @@ async function getDailyReport(dateStr) {
 }
 
 async function getWeeklyReport() {
-  // Last 7 days in Lagos time (trade_date is YYYY-MM-DD)
   const res = await db.query(
     `SELECT trade_date AS date, COUNT(*)::int AS trades,
       COALESCE(SUM(pnl_usdt),0)::float AS total_pnl,
@@ -322,12 +314,11 @@ function getRollingAverage(prices) {
 }
 
 async function resetDailyStats(newDateStr) {
-  // NEW: Before wiping, log yesterday's total win/loss report
   if (state.currentDate) {
     try {
       const y = await getDailyReport(state.currentDate);
       addLog(`DAILY REPORT ${y.date} | Trades: ${y.trades} | Wins: ${y.wins} | Losses: ${y.losses} | Total PnL: $${y.totalPnlUsdt} | ${y.verdict}`);
-    } catch (e) { /* report is extra, never block reset */ }
+    } catch (e) { }
   }
   state.currentDate = newDateStr;
   state.referencePrice = null;
@@ -338,7 +329,6 @@ async function resetDailyStats(newDateStr) {
   state.lossesToday = 0;
   state.dailyPnlUsdt = 0;
   state.cooldownUntil = null;
-  // UPDATED: Daily loss resets daily and is auto-calculated from dashboard Total Amount
   state.maxDailyLossUsdt = calcDailyLossFromAmount(state.tradeAmountUsdt);
   addLog(`New trading day initialized (${newDateStr}). Daily counters reset. Total Amount: $${state.tradeAmountUsdt} | Auto Daily Loss Limit: $${state.maxDailyLossUsdt}`);
   await saveStateToDb();
@@ -351,15 +341,10 @@ async function setReferencePrice(price) {
   await saveStateToDb();
 }
 
-// REMOVED: updateTrailingReference - No dip anymore, so no trailing reference. Kept as no-op so old calls don't break.
 async function updateTrailingReference(livePrice) {
   return;
 }
 
-// CHANGED 2026-11-25: TREND FILTER = 10-MIN INTRADAY, NOT 5-DAY DAILY.
-// Uses priceHistory (20 polls x 30s = 10 min). Excludes current tick so livePrice is not compared to itself.
-// If <5 samples (just started / after restart), allow buy - don't block on no data.
-// Old 5-day klines code REMOVED - it blocked for days when SOL was $68 vs $70.32 avg.
 async function isUptrend(livePrice) {
   try {
     const history = (state.priceHistory || []).slice(0, -1).slice(-DEFAULTS.PRICE_WINDOW_SIZE);
@@ -371,6 +356,149 @@ async function isUptrend(livePrice) {
   } catch (err) {
     addLog(`Trend check failed (${err.message}) - allowing buy to keep old behaviour`);
     return true;
+  }
+}
+
+// ==========================================
+// 5b. NEW: LIVE PROFIT + REAL BALANCE HELPERS - DISPLAY ONLY, NO TRADING
+// ==========================================
+function calcLiveProfit() {
+  // ALWAYS returns an object, even when flat, so box never disappears
+  const dailyClosed = Number(state.dailyPnlUsdt || 0);
+  if (!state.inPosition || !state.entryPrice || !state.lastPrice || !state.purchasedQty) {
+    return {
+      status: 'WAITING',
+      statusText: 'Waiting to Buy...',
+      entryPrice: null,
+      currentPrice: state.lastPrice,
+      qty: 0,
+      buyValue: 0,
+      currentValue: 0,
+      grossProfitUsdt: 0,
+      grossPercent: 0,
+      feesUsdt: 0,
+      netProfitUsdt: 0,
+      netPercent: 0,
+      totalAmountPercent: 0,
+      feeCovered: false,
+      needToCoverFeesUsdt: 0,
+      priceToCoverFees: null,
+      dailyPnlClosed: dailyClosed,
+      combinedWithDay: Number(dailyClosed.toFixed(4)),
+      dayLossCovered: dailyClosed >= 0,
+      needToCoverDayLossUsdt: dailyClosed < 0 ? Math.abs(dailyClosed) : 0,
+      priceToCoverDayLoss: null,
+      distanceToSlUsdt: null,
+      distanceToSlPercent: null,
+      panicLevel: 'WAITING',
+      panicText: 'No position - waiting for next buy',
+    };
+  }
+  const entry = Number(state.entryPrice);
+  const now = Number(state.lastPrice);
+  const qty = Number(state.purchasedQty);
+  const buyValue = entry * qty;
+  const currentValue = now * qty;
+  const gross = Number(((now - entry) * qty).toFixed(4));
+  const grossPercent = Number((((now - entry) / entry) * 100).toFixed(3));
+  const fees = Number(((buyValue + currentValue) * DEFAULTS.FEE_RATE_PER_SIDE).toFixed(4));
+  const net = Number((gross - fees).toFixed(4));
+  const netPercent = Number(((net / buyValue) * 100).toFixed(3));
+  const totalAmountPercent = Number((((currentValue - buyValue) / buyValue) * 100).toFixed(3));
+  const feeCovered = gross >= fees;
+  const needToCoverFees = feeCovered ? 0 : Number((fees - gross).toFixed(4));
+  const priceToCoverFees = feeCovered ? null : Number((entry + (fees / qty)).toFixed(4));
+  const combinedWithDay = Number((dailyClosed + net).toFixed(4));
+  const dayLossCovered = dailyClosed >= 0 ? true : combinedWithDay >= 0;
+  const needToCoverDayLoss = dayLossCovered ? 0 : Number(Math.abs(combinedWithDay).toFixed(4));
+  const priceToCoverDayLoss = dayLossCovered ? null : Number((entry + ((fees - dailyClosed) / qty)).toFixed(4));
+  const sl = Number(state.stopLossPrice || 0);
+  const distanceToSlUsdt = sl ? Number(((now - sl) * qty).toFixed(4)) : null;
+  const distanceToSlPercent = sl ? Number((((now - sl) / entry) * 100).toFixed(3)) : null;
+  // Panic level: GREEN = hold, YELLOW = watch, RED = think about panic
+  let panicLevel = 'GREEN';
+  let panicText = 'HOLD - In profit, fees covered';
+  if (net < 0 && distanceToSlPercent !== null && distanceToSlPercent < 0.35) {
+    panicLevel = 'RED';
+    panicText = 'THINK ABOUT PANIC - Close to SL, big loss';
+  } else if (net < 0) {
+    panicLevel = 'YELLOW';
+    panicText = 'WATCH - In loss, but still far from SL';
+  } else if (!feeCovered) {
+    panicLevel = 'YELLOW';
+    panicText = 'WATCH - Small profit, fees not covered yet';
+  }
+  return {
+    status: 'HOLDING',
+    statusText: 'Holding...',
+    entryPrice: entry,
+    currentPrice: now,
+    qty,
+    buyValue: Number(buyValue.toFixed(4)),
+    currentValue: Number(currentValue.toFixed(4)),
+    grossProfitUsdt: gross,
+    grossPercent,
+    feesUsdt: fees,
+    netProfitUsdt: net,
+    netPercent,
+    totalAmountPercent,
+    feeCovered,
+    needToCoverFeesUsdt: needToCoverFees,
+    priceToCoverFees,
+    dailyPnlClosed: dailyClosed,
+    combinedWithDay,
+    dayLossCovered,
+    needToCoverDayLossUsdt: needToCoverDayLoss,
+    priceToCoverDayLoss,
+    distanceToSlUsdt,
+    distanceToSlPercent,
+    stopLossPrice: sl,
+    takeProfitPrice: Number(state.takeProfitPrice || 0),
+    panicLevel,
+    panicText,
+  };
+}
+
+async function getRealAccountBalance() {
+  // READ ONLY - just display, never moves money
+  try {
+    const data = await binanceSignedRequest('GET', '/v3/account');
+    const balances = Array.isArray(data.balances) ? data.balances : [];
+    const usdt = balances.find((b) => b.asset === 'USDT');
+    const sol = balances.find((b) => b.asset === 'SOL');
+    const usdtFree = usdt ? parseFloat(usdt.free) : 0;
+    const usdtLocked = usdt ? parseFloat(usdt.locked) : 0;
+    const solFree = sol ? parseFloat(sol.free) : 0;
+    const solLocked = sol ? parseFloat(sol.locked) : 0;
+    const solTotal = solFree + solLocked;
+    const lastPrice = Number(state.lastPrice || 0);
+    const solValueUsdt = Number((solTotal * lastPrice).toFixed(4));
+    const totalValueUsdt = Number((usdtFree + usdtLocked + solValueUsdt).toFixed(4));
+    return {
+      available: true,
+      network: USE_BINANCE_TESTNET ? 'BINANCE_TESTNET' : 'BINANCE_LIVE',
+      usdtFree: Number(usdtFree.toFixed(4)),
+      usdtLocked: Number(usdtLocked.toFixed(4)),
+      usdtTotal: Number((usdtFree + usdtLocked).toFixed(4)),
+      solFree: Number(solFree.toFixed(4)),
+      solLocked: Number(solLocked.toFixed(4)),
+      solTotal: Number(solTotal.toFixed(4)),
+      solPrice: lastPrice,
+      solValueUsdt,
+      totalValueUsdt,
+      note: USE_BINANCE_TESTNET ? 'Testnet fake balance' : 'Real Live balance - read only',
+    };
+  } catch (err) {
+    return {
+      available: false,
+      network: USE_BINANCE_TESTNET ? 'BINANCE_TESTNET' : 'BINANCE_LIVE',
+      usdtFree: 0, usdtLocked: 0, usdtTotal: 0,
+      solFree: 0, solLocked: 0, solTotal: 0,
+      solPrice: Number(state.lastPrice || 0),
+      solValueUsdt: 0,
+      totalValueUsdt: 0,
+      note: 'Balance unavailable: ' + err.message,
+    };
   }
 }
 
@@ -390,7 +518,6 @@ async function getSolAvailableBalance() {
   return assetInfo ? parseFloat(assetInfo.free) : 0;
 }
 
-// NEW: Dynamic USDT - real free balance before every BUY
 async function getUsdtAvailableBalance() {
   const data = await binanceSignedRequest('GET', '/v3/account');
   const assetInfo = Array.isArray(data.balances) ? data.balances.find((b) => b.asset === 'USDT') : null;
@@ -398,10 +525,6 @@ async function getUsdtAvailableBalance() {
 }
 
 async function executeMarketBuy(currentPrice) {
-  // UPDATED 2026-11-23: HYBRID AMOUNT - Fixed + 99% cut.
-  // Dashboard amount is the TARGET. Actual buy = min(Dashboard, Free x 0.99).
-  // So if balance drops after a loss, bot buys a little smaller and NEVER deadlocks.
-  // Dashboard amount (state.tradeAmountUsdt) is NOT overwritten, so Auto Daily Loss stays correct.
   const dashboardAmount = Number(state.tradeAmountUsdt || DEFAULTS.TRADE_AMOUNT_USDT);
   const freeUsdt = await getUsdtAvailableBalance();
   const amountUsdt = Number(Math.min(dashboardAmount, freeUsdt * 0.99).toFixed(2));
@@ -413,7 +536,6 @@ async function executeMarketBuy(currentPrice) {
 
   const solBalBefore = await getSolAvailableBalance();
 
-  // NEW: Capture Binance order receipt to get ACTUAL fill price
   const order = await binanceSignedRequest('POST', '/v3/order', {
     symbol: DEFAULTS.SYMBOL,
     side: 'BUY',
@@ -426,7 +548,6 @@ async function executeMarketBuy(currentPrice) {
   const sellableQty = Math.floor((solBalAfter - solBalBefore) * 1000) / 1000;
   if (sellableQty <= 0) throw new Error('Buy settled with 0 sellable SOL quantity (check minimum precision/balance).');
 
-  // NEW: Actual fill = cummulativeQuoteQty / executedQty, fallback to ticker if Binance returns 0
   let actualEntryPrice = currentPrice;
   const execQty = parseFloat(order.executedQty || '0');
   const cumQuote = parseFloat(order.cummulativeQuoteQty || '0');
@@ -460,7 +581,6 @@ async function executeMarketSell(currentPrice, reason) {
     symbol: DEFAULTS.SYMBOL, side: 'SELL', type: 'MARKET', quantity: qtyToSell.toString(),
   });
 
-  // NEW: Actual sell fill price from receipt
   let actualExitPrice = currentPrice;
   const execQty = parseFloat(order.executedQty || '0');
   const cumQuote = parseFloat(order.cummulativeQuoteQty || '0');
@@ -488,8 +608,6 @@ async function executeMarketSell(currentPrice, reason) {
 
   state.inPosition = false; state.entryPrice = null; state.highestPriceSinceEntry = null;
   state.trailingActive = false; state.takeProfitPrice = null; state.stopLossPrice = null; state.purchasedQty = 0;
-  // UPDATED Sell Fast V3: DO NOT wipe reference. Keep it at sell price so cooldown WATCH mode can keep trailing it up.
-  // Old code set referencePrice = null here, which made bot blind during cooldown.
   state.referencePrice = actualExitPrice;
   state.buyTargetPrice = null;
   state.cooldownUntil = Date.now() + DEFAULTS.COOLDOWN_MINUTES * 60 * 1000;
@@ -498,7 +616,7 @@ async function executeMarketSell(currentPrice, reason) {
 }
 
 // ==========================================
-// 7. MAIN TRADING ENGINE LOOP
+// 7. MAIN TRADING ENGINE LOOP - UNTOUCHED
 // ==========================================
 async function runTradingCycle() {
   if (!state.isRunning) return;
@@ -512,7 +630,6 @@ async function runTradingCycle() {
     state.priceHistory.push(livePrice);
     if (state.priceHistory.length > DEFAULTS.PRICE_WINDOW_SIZE) state.priceHistory.shift();
 
-    // 1. OPEN POSITION MANAGEMENT (Trailing TP + Hard TP + Hard SL) - logic untouched, only numbers in DEFAULTS changed
     if (state.inPosition && state.entryPrice) {
       if (state.highestPriceSinceEntry === null || livePrice > state.highestPriceSinceEntry) {
         state.highestPriceSinceEntry = livePrice;
@@ -536,16 +653,10 @@ async function runTradingCycle() {
       return;
     }
 
-    // 2. DAILY CIRCUIT BREAKERS - UPDATED: NO MAX TRADES PER DAY, 24/7
-    // REMOVED: if (state.tradesToday >= MAX_TRADES_PER_DAY) return;
-    if (state.consecutiveLosses >= DEFAULTS.MAX_CONSECUTIVE_LOSSES) return; // Sell Fast V3: now 4
-    if (state.dailyPnlUsdt <= -Math.abs(Number(state.maxDailyLossUsdt))) return; // auto from dashboard Total Amount
+    if (state.consecutiveLosses >= DEFAULTS.MAX_CONSECUTIVE_LOSSES) return;
+    if (state.dailyPnlUsdt <= -Math.abs(Number(state.maxDailyLossUsdt))) return;
 
-    // 3. REMOVED: ACTIVE WAT HOURS CHECK - Now True 24/7
-
-    // 4. COOLDOWN CHECK - UPDATED Sell Fast V3: WATCH MODE, not blind sleep
     if (state.cooldownUntil && Date.now() < state.cooldownUntil) {
-      // WATCH ONLY: no buy, no trailing reference (dip removed)
       if (!state.referencePrice) {
         state.referencePrice = livePrice;
       }
@@ -555,20 +666,16 @@ async function runTradingCycle() {
       return;
     }
 
-    // 5. SET MORNING OR POST-COOLDOWN REFERENCE ANCHOR - UNTOUCHED
     if (!state.referencePrice) {
       state.cooldownUntil = null;
       await setReferencePrice(livePrice);
       return;
     }
 
-    // 5b. REMOVED: TRAILING REFERENCE UPWARD - dip removed, so no trailing reference
     await updateTrailingReference(livePrice);
 
-    // 6. BOUNCE BUY TRIGGER - DIP REMOVED. Only Bounce + 10m Trend Filter
     const bounceConfirmed = !state.requireBounceTick || prevPrice === null || livePrice > prevPrice;
     if (bounceConfirmed) {
-      // CHANGED: Don't buy in downtrend - 10m intraday check, not 5-day
       const uptrend = await isUptrend(livePrice);
       if (!uptrend) {
         await saveStateToDb();
@@ -614,7 +721,7 @@ app.get('/', (req, res) => {
     highestPriceSinceEntry: state.highestPriceSinceEntry,
     trailingActive: state.trailingActive,
     statsToday: {
-      trades: state.tradesToday, // UPDATED: No daily limit, shows total count only
+      trades: state.tradesToday,
       wins: state.winsToday, losses: state.lossesToday,
       consecutiveLosses: state.consecutiveLosses, dailyPnlUsdt: state.dailyPnlUsdt,
     },
@@ -626,6 +733,8 @@ app.get('/api/admin/dashboard', requireAdminAuth, async (req, res) => {
     const trades = await getRecentTradesFromDb(50);
     const dailyReport = state.currentDate ? await getDailyReport(state.currentDate) : null;
     const weeklyReport = await getWeeklyReport();
+    const liveProfit = calcLiveProfit();
+    const accountBalance = await getRealAccountBalance();
     res.json({
       network: USE_BINANCE_TESTNET ? 'BINANCE_TESTNET' : 'BINANCE_LIVE',
       status: state.isRunning ? 'RUNNING' : 'PAUSED',
@@ -652,6 +761,8 @@ app.get('/api/admin/dashboard', requireAdminAuth, async (req, res) => {
         highestPriceSinceEntry: state.highestPriceSinceEntry, trailingActive: state.trailingActive,
         takeProfitPrice: state.takeProfitPrice, stopLossPrice: state.stopLossPrice, purchasedQty: state.purchasedQty,
       },
+      liveProfit,
+      accountBalance,
       statsToday: {
         trades: state.tradesToday,
         wins: state.winsToday, losses: state.lossesToday,
@@ -665,7 +776,6 @@ app.get('/api/admin/dashboard', requireAdminAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// NEW: Daily report endpoint - total win/loss for a day
 app.get('/api/admin/report/daily', requireAdminAuth, async (req, res) => {
   try {
     const date = req.query.date || state.currentDate || getLagosTimeInfo().dateStr;
@@ -674,7 +784,6 @@ app.get('/api/admin/report/daily', requireAdminAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// NEW: Weekly report endpoint - total win/loss last 7 days
 app.get('/api/admin/report/weekly', requireAdminAuth, async (req, res) => {
   try {
     const report = await getWeeklyReport();
@@ -689,10 +798,8 @@ app.post('/api/admin/config', requireAdminAuth, async (req, res) => {
       const amt = Number(tradeAmountUsdt);
       if (!Number.isFinite(amt) || amt < 5) return res.status(400).json({ error: 'tradeAmountUsdt must be a number >= 5.' });
       state.tradeAmountUsdt = Number(amt.toFixed(2));
-      // UPDATED: Daily loss sets itself from Total Amount - you don't set it manually anymore
       state.maxDailyLossUsdt = calcDailyLossFromAmount(state.tradeAmountUsdt);
     }
-    // UPDATED: maxDailyLossUsdt in request is IGNORED - it is auto-calculated. Kept for backward compat, does not override.
     if (requireBounceTick !== undefined) state.requireBounceTick = Boolean(requireBounceTick);
     addLog(`Admin updated config: tradeAmountUsdt=$${state.tradeAmountUsdt}, AUTO maxDailyLossUsdt=$${state.maxDailyLossUsdt}, requireBounceTick=${state.requireBounceTick}`);
     await saveStateToDb();
