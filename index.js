@@ -25,12 +25,12 @@ const DEFAULTS = {
   SYMBOL: 'SOLUSDT',
   TRADE_AMOUNT_USDT: 5.5,        // Dashboard Total Amount - bot uses EXACTLY this per trade, NOT 99% of balance
   MIN_TRADE_USDT: 5.10,          // Must stay above Binance $5.00 minimum
-  BUY_DIP_PERCENT: 0.02,         // -2.0% dip from referencePrice - UNTOUCHED
+  // REMOVED: BUY_DIP_PERCENT - No -2% dip anymore
   TAKE_PROFIT_PERCENT: 0.022,    // Sell Fast V3: +2.2% hard take-profit fallback - BACKUP ONLY, trailing should beat it
   STOP_LOSS_PERCENT: 0.01,       // CHANGED 2026-11-25: was 0.008 -> -1.0% hard stop-loss, more breathing room vs noise
   TRAIL_START_PERCENT: 0.012,    // CHANGED 2026-11-25: was 0.022 -> Start trailing once +1.2% above entry. FIX: old 2.2% = same as Hard TP, so trailing never woke up. Now 1.2% < 2.2%, trailing has room to run.
   TRAIL_PULLBACK_PERCENT: 0.005, // UNTOUCHED: Sell if price pulls back 0.5% from peak
-  REQUIRE_BOUNCE_TICK: true,     // Require livePrice > lastPrice on dip trigger
+  REQUIRE_BOUNCE_TICK: true,     // Require livePrice > lastPrice on buy trigger
   PRICE_WINDOW_SIZE: 20,         // Rolling price samples for context - 20 x 30s = 10 MIN TREND WINDOW
   FEE_RATE_PER_SIDE: 0.001,      // ~0.1% spot fee estimate per side
   // UPDATED: MAX_TRADES_PER_DAY REMOVED - No limit, keep going 24/7
@@ -346,21 +346,14 @@ async function resetDailyStats(newDateStr) {
 
 async function setReferencePrice(price) {
   state.referencePrice = price;
-  state.buyTargetPrice = Number((price * (1 - DEFAULTS.BUY_DIP_PERCENT)).toFixed(4));
-  addLog(`Reference price set to $${price.toFixed(4)} | Buy Target (-2%): $${state.buyTargetPrice}`);
+  state.buyTargetPrice = null;
+  addLog(`Reference price set to $${price.toFixed(4)} | No Dip - Buy on Trend + Bounce`);
   await saveStateToDb();
 }
 
-// NEW: Update trailing reference upward only - never down, only when not in position
+// REMOVED: updateTrailingReference - No dip anymore, so no trailing reference. Kept as no-op so old calls don't break.
 async function updateTrailingReference(livePrice) {
-  if (state.inPosition) return;
-  if (!state.referencePrice) return;
-  if (livePrice > state.referencePrice) {
-    state.referencePrice = livePrice;
-    state.buyTargetPrice = Number((livePrice * (1 - DEFAULTS.BUY_DIP_PERCENT)).toFixed(4));
-    addLog(`Trailing UP: Reference $${state.referencePrice.toFixed(4)} | New Buy Target: $${state.buyTargetPrice}`);
-    await saveStateToDb();
-  }
+  return;
 }
 
 // CHANGED 2026-11-25: TREND FILTER = 10-MIN INTRADAY, NOT 5-DAY DAILY.
@@ -416,7 +409,7 @@ async function executeMarketBuy(currentPrice) {
     throw new Error(`Trade amount $${amountUsdt.toFixed(2)} < minimum $${DEFAULTS.MIN_TRADE_USDT}. Increase Total Amount in dashboard or top up USDT. Free: $${freeUsdt.toFixed(2)} | Dashboard: $${dashboardAmount.toFixed(2)}`);
   }
 
-  addLog(`Dip + bounce + 10m UPTREND confirmed! Buying $${amountUsdt.toFixed(2)} of ${DEFAULTS.SYMBOL} @ ~$${currentPrice.toFixed(4)} (Dashboard: $${dashboardAmount.toFixed(2)} | Free USDT: $${freeUsdt.toFixed(2)})...`);
+  addLog(`Bounce + 10m UPTREND confirmed - No Dip! Buying $${amountUsdt.toFixed(2)} of ${DEFAULTS.SYMBOL} @ ~$${currentPrice.toFixed(4)} (Dashboard: $${dashboardAmount.toFixed(2)} | Free USDT: $${freeUsdt.toFixed(2)})...`);
 
   const solBalBefore = await getSolAvailableBalance();
 
@@ -498,9 +491,9 @@ async function executeMarketSell(currentPrice, reason) {
   // UPDATED Sell Fast V3: DO NOT wipe reference. Keep it at sell price so cooldown WATCH mode can keep trailing it up.
   // Old code set referencePrice = null here, which made bot blind during cooldown.
   state.referencePrice = actualExitPrice;
-  state.buyTargetPrice = Number((actualExitPrice * (1 - DEFAULTS.BUY_DIP_PERCENT)).toFixed(4));
+  state.buyTargetPrice = null;
   state.cooldownUntil = Date.now() + DEFAULTS.COOLDOWN_MINUTES * 60 * 1000;
-  addLog(`Cooldown WATCH active for ${DEFAULTS.COOLDOWN_MINUTES}m. Reference kept at $${state.referencePrice} | Buy Target: $${state.buyTargetPrice} | Watching, not buying.`);
+  addLog(`Cooldown WATCH active for ${DEFAULTS.COOLDOWN_MINUTES}m. Reference kept at $${state.referencePrice} | No Dip - Will buy on Trend + Bounce after cooldown.`);
   await saveStateToDb();
 }
 
@@ -552,15 +545,12 @@ async function runTradingCycle() {
 
     // 4. COOLDOWN CHECK - UPDATED Sell Fast V3: WATCH MODE, not blind sleep
     if (state.cooldownUntil && Date.now() < state.cooldownUntil) {
-      // WATCH ONLY: follow price up, update reference, but DO NOT BUY
+      // WATCH ONLY: no buy, no trailing reference (dip removed)
       if (!state.referencePrice) {
         state.referencePrice = livePrice;
-        state.buyTargetPrice = Number((livePrice * (1 - DEFAULTS.BUY_DIP_PERCENT)).toFixed(4));
-      } else {
-        await updateTrailingReference(livePrice);
       }
       const minsLeft = Math.max(0, Math.ceil((state.cooldownUntil - Date.now()) / 60000));
-      addLog(`COOLDOWN WATCHING | Price $${livePrice.toFixed(4)} | Reference $${state.referencePrice.toFixed(4)} | Buy Target $${state.buyTargetPrice} | ${minsLeft}m left - watching, not buying`);
+      addLog(`COOLDOWN WATCHING | Price $${livePrice.toFixed(4)} | Reference $${state.referencePrice.toFixed(4)} | ${minsLeft}m left - watching, not buying`);
       await saveStateToDb();
       return;
     }
@@ -572,13 +562,12 @@ async function runTradingCycle() {
       return;
     }
 
-    // 5b. NEW: TRAILING REFERENCE UPWARD - only when not in position
+    // 5b. REMOVED: TRAILING REFERENCE UPWARD - dip removed, so no trailing reference
     await updateTrailingReference(livePrice);
 
-    // 6. DIP + BOUNCE BUY TRIGGER - UNTOUCHED LOGIC + NEW 10m TREND FILTER CHECK FIRST
-    const dipReached = livePrice <= state.buyTargetPrice;
+    // 6. BOUNCE BUY TRIGGER - DIP REMOVED. Only Bounce + 10m Trend Filter
     const bounceConfirmed = !state.requireBounceTick || prevPrice === null || livePrice > prevPrice;
-    if (dipReached && bounceConfirmed) {
+    if (bounceConfirmed) {
       // CHANGED: Don't buy in downtrend - 10m intraday check, not 5-day
       const uptrend = await isUptrend(livePrice);
       if (!uptrend) {
@@ -645,7 +634,6 @@ app.get('/api/admin/dashboard', requireAdminAuth, async (req, res) => {
         tradeAmountUsdt: state.tradeAmountUsdt,
         maxDailyLossUsdt: state.maxDailyLossUsdt,
         requireBounceTick: state.requireBounceTick,
-        buyDipPercent: DEFAULTS.BUY_DIP_PERCENT,
         trailStartPercent: DEFAULTS.TRAIL_START_PERCENT,
         trailPullbackPercent: DEFAULTS.TRAIL_PULLBACK_PERCENT,
         stopLossPercent: DEFAULTS.STOP_LOSS_PERCENT,
