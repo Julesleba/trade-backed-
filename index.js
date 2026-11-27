@@ -30,7 +30,9 @@ const DEFAULTS = {
   TRAIL_START_PERCENT: 0.012,
   TRAIL_PULLBACK_PERCENT: 0.005,
   REQUIRE_BOUNCE_TICK: true,
-  PRICE_WINDOW_SIZE: 20,
+  PRICE_WINDOW_SIZE: 60, // CHANGED: keep 60 for 30m, we slice 20 for 10m
+  PRICE_WINDOW_10M: 20, // NEW: 20 x 30s = 10m - FAST mode
+  PRICE_WINDOW_30M: 60, // NEW: 60 x 30s = 30m - CAREFUL mode
   FEE_RATE_PER_SIDE: 0.001,
   MAX_CONSECUTIVE_LOSSES: 4,
   DAILY_LOSS_PERCENT_OF_AMOUNT: 0.08,
@@ -139,6 +141,9 @@ let state = {
   lastPrice: null,
   priceHistory: [],
   logs: [],
+  // NEW: ADAPTIVE TIMEFRAME - 10m on win, 30m on loss
+  adaptiveMode: 'FAST_10M', // 'FAST_10M' | 'CAREFUL_30M'
+  lastTradeOutcome: null, // 'WIN' | 'LOSS' | null
 };
 
 function calcDailyLossFromAmount(amountUsdt) {
@@ -188,6 +193,9 @@ async function initDatabase() {
       priceHistory: Array.isArray(res.rows[0].data.priceHistory)
         ? res.rows[0].data.priceHistory.slice(-DEFAULTS.PRICE_WINDOW_SIZE)
         : [],
+      // Keep adaptive mode after restart, default to FAST if missing
+      adaptiveMode: res.rows[0].data.adaptiveMode || 'FAST_10M',
+      lastTradeOutcome: res.rows[0].data.lastTradeOutcome || null,
     };
   } else {
     state.maxDailyLossUsdt = calcDailyLossFromAmount(state.tradeAmountUsdt);
@@ -313,6 +321,38 @@ function getRollingAverage(prices) {
   return Number((sum / prices.length).toFixed(4));
 }
 
+// NEW: ADAPTIVE TIMEFRAME HELPERS
+function getAdaptiveWindowSize() {
+  return state.adaptiveMode === 'CAREFUL_30M'
+    ? DEFAULTS.PRICE_WINDOW_30M
+    : DEFAULTS.PRICE_WINDOW_10M;
+}
+
+function getAdaptiveLabel() {
+  return state.adaptiveMode === 'CAREFUL_30M'
+    ? '30m CAREFUL'
+    : '10m FAST';
+}
+
+function updateAdaptiveModeAfterTrade(outcome) {
+  state.lastTradeOutcome = outcome;
+  if (outcome === 'WIN') {
+    if (state.adaptiveMode !== 'FAST_10M') {
+      addLog(`ADAPTIVE SWITCH: WIN -> Back to FAST 10m mode. Market is giving us wins, stay fast.`);
+    } else {
+      addLog(`ADAPTIVE: WIN -> Stay on FAST 10m mode.`);
+    }
+    state.adaptiveMode = 'FAST_10M';
+  } else {
+    if (state.adaptiveMode !== 'CAREFUL_30M') {
+      addLog(`ADAPTIVE SWITCH: LOSS -> Switch to CAREFUL 30m mode. Market is tricky, watch carefully, wait for real trend.`);
+    } else {
+      addLog(`ADAPTIVE: LOSS -> Stay on CAREFUL 30m mode. Still watching carefully.`);
+    }
+    state.adaptiveMode = 'CAREFUL_30M';
+  }
+}
+
 async function resetDailyStats(newDateStr) {
   if (state.currentDate) {
     try {
@@ -330,7 +370,10 @@ async function resetDailyStats(newDateStr) {
   state.dailyPnlUsdt = 0;
   state.cooldownUntil = null;
   state.maxDailyLossUsdt = calcDailyLossFromAmount(state.tradeAmountUsdt);
-  addLog(`New trading day initialized (${newDateStr}). Daily counters reset. Total Amount: $${state.tradeAmountUsdt} | Auto Daily Loss Limit: $${state.maxDailyLossUsdt}`);
+  // NEW: New day = fresh start on FAST 10m, we forget yesterday's loss
+  state.adaptiveMode = 'FAST_10M';
+  state.lastTradeOutcome = null;
+  addLog(`New trading day initialized (${newDateStr}). Daily counters reset. Total Amount: $${state.tradeAmountUsdt} | Auto Daily Loss Limit: $${state.maxDailyLossUsdt} | Adaptive: FAST 10m`);
   await saveStateToDb();
 }
 
@@ -347,11 +390,14 @@ async function updateTrailingReference(livePrice) {
 
 async function isUptrend(livePrice) {
   try {
-    const history = (state.priceHistory || []).slice(0, -1).slice(-DEFAULTS.PRICE_WINDOW_SIZE);
+    // CHANGED: window now depends on adaptiveMode - 20 for 10m, 60 for 30m
+    const windowSize = getAdaptiveWindowSize();
+    const label = getAdaptiveLabel();
+    const history = (state.priceHistory || []).slice(0, -1).slice(-windowSize);
     if (history.length < 5) return true;
     const avg = history.reduce((a, b) => a + b, 0) / history.length;
     const up = livePrice > avg;
-    if (!up) addLog(`TREND FILTER BLOCKED BUY: Price $${livePrice.toFixed(4)} is BELOW 10m avg $${avg.toFixed(4)} (downtrend last 10m) - Waiting`);
+    if (!up) addLog(`TREND FILTER BLOCKED BUY [${label}]: Price $${livePrice.toFixed(4)} is BELOW ${label} avg $${avg.toFixed(4)} (downtrend) - Waiting`);
     return up;
   } catch (err) {
     addLog(`Trend check failed (${err.message}) - allowing buy to keep old behaviour`);
@@ -363,7 +409,6 @@ async function isUptrend(livePrice) {
 // 5b. NEW: LIVE PROFIT + REAL BALANCE HELPERS - DISPLAY ONLY, NO TRADING
 // ==========================================
 function calcLiveProfit() {
-  // ALWAYS returns an object, even when flat, so box never disappears
   const dailyClosed = Number(state.dailyPnlUsdt || 0);
   if (!state.inPosition || !state.entryPrice || !state.lastPrice || !state.purchasedQty) {
     return {
@@ -415,7 +460,6 @@ function calcLiveProfit() {
   const sl = Number(state.stopLossPrice || 0);
   const distanceToSlUsdt = sl ? Number(((now - sl) * qty).toFixed(4)) : null;
   const distanceToSlPercent = sl ? Number((((now - sl) / entry) * 100).toFixed(3)) : null;
-  // Panic level: GREEN = hold, YELLOW = watch, RED = think about panic
   let panicLevel = 'GREEN';
   let panicText = 'HOLD - In profit, fees covered';
   if (net < 0 && distanceToSlPercent !== null && distanceToSlPercent < 0.35) {
@@ -460,7 +504,6 @@ function calcLiveProfit() {
 }
 
 async function getRealAccountBalance() {
-  // READ ONLY - just display, never moves money
   try {
     const data = await binanceSignedRequest('GET', '/v3/account');
     const balances = Array.isArray(data.balances) ? data.balances : [];
@@ -532,7 +575,7 @@ async function executeMarketBuy(currentPrice) {
     throw new Error(`Trade amount $${amountUsdt.toFixed(2)} < minimum $${DEFAULTS.MIN_TRADE_USDT}. Increase Total Amount in dashboard or top up USDT. Free: $${freeUsdt.toFixed(2)} | Dashboard: $${dashboardAmount.toFixed(2)}`);
   }
 
-  addLog(`Bounce + 10m UPTREND confirmed - No Dip! Buying $${amountUsdt.toFixed(2)} of ${DEFAULTS.SYMBOL} @ ~$${currentPrice.toFixed(4)} (Dashboard: $${dashboardAmount.toFixed(2)} | Free USDT: $${freeUsdt.toFixed(2)})...`);
+  addLog(`Bounce + ${getAdaptiveLabel()} UPTREND confirmed - No Dip! Buying $${amountUsdt.toFixed(2)} of ${DEFAULTS.SYMBOL} @ ~$${currentPrice.toFixed(4)} (Dashboard: $${dashboardAmount.toFixed(2)} | Free USDT: $${freeUsdt.toFixed(2)})...`);
 
   const solBalBefore = await getSolAvailableBalance();
 
@@ -561,7 +604,7 @@ async function executeMarketBuy(currentPrice) {
   state.takeProfitPrice = Number((state.entryPrice * (1 + DEFAULTS.TAKE_PROFIT_PERCENT)).toFixed(4));
   state.stopLossPrice = Number((state.entryPrice * (1 - DEFAULTS.STOP_LOSS_PERCENT)).toFixed(4));
 
-  addLog(`BOUGHT ${sellableQty} SOL @ ACTUAL $${state.entryPrice.toFixed(4)} (ticker was $${currentPrice.toFixed(4)}) | Trail Start (+${(DEFAULTS.TRAIL_START_PERCENT * 100).toFixed(1)}%) | Hard TP: $${state.takeProfitPrice} | SL: $${state.stopLossPrice}`);
+  addLog(`BOUGHT ${sellableQty} SOL @ ACTUAL $${state.entryPrice.toFixed(4)} (ticker was $${currentPrice.toFixed(4)}) | Trail Start (+${(DEFAULTS.TRAIL_START_PERCENT * 100).toFixed(1)}%) | Hard TP: $${state.takeProfitPrice} | SL: $${state.stopLossPrice} | Mode: ${getAdaptiveLabel()}`);
   await saveStateToDb();
 }
 
@@ -606,17 +649,20 @@ async function executeMarketSell(currentPrice, reason) {
   await insertTradeToDb(record);
   addLog(`SOLD ${qtyToSell} SOL @ ACTUAL $${actualExitPrice.toFixed(4)} | ${record.outcome} ($${netPnl} net) | Daily PnL: $${state.dailyPnlUsdt}`);
 
+  // NEW: ADAPTIVE SWITCH - This is where 10m <-> 30m happens
+  updateAdaptiveModeAfterTrade(record.outcome);
+
   state.inPosition = false; state.entryPrice = null; state.highestPriceSinceEntry = null;
   state.trailingActive = false; state.takeProfitPrice = null; state.stopLossPrice = null; state.purchasedQty = 0;
   state.referencePrice = actualExitPrice;
   state.buyTargetPrice = null;
   state.cooldownUntil = Date.now() + DEFAULTS.COOLDOWN_MINUTES * 60 * 1000;
-  addLog(`Cooldown WATCH active for ${DEFAULTS.COOLDOWN_MINUTES}m. Reference kept at $${state.referencePrice} | No Dip - Will buy on Trend + Bounce after cooldown.`);
+  addLog(`Cooldown WATCH active for ${DEFAULTS.COOLDOWN_MINUTES}m. Reference kept at $${state.referencePrice} | Next mode: ${getAdaptiveLabel()}`);
   await saveStateToDb();
 }
 
 // ==========================================
-// 7. MAIN TRADING ENGINE LOOP - UNTOUCHED
+// 7. MAIN TRADING ENGINE LOOP
 // ==========================================
 async function runTradingCycle() {
   if (!state.isRunning) return;
@@ -661,7 +707,7 @@ async function runTradingCycle() {
         state.referencePrice = livePrice;
       }
       const minsLeft = Math.max(0, Math.ceil((state.cooldownUntil - Date.now()) / 60000));
-      addLog(`COOLDOWN WATCHING | Price $${livePrice.toFixed(4)} | Reference $${state.referencePrice.toFixed(4)} | ${minsLeft}m left - watching, not buying`);
+      addLog(`COOLDOWN WATCHING | Price $${livePrice.toFixed(4)} | Reference $${state.referencePrice.toFixed(4)} | ${minsLeft}m left - watching, not buying | Mode: ${getAdaptiveLabel()}`);
       await saveStateToDb();
       return;
     }
@@ -720,6 +766,9 @@ app.get('/', (req, res) => {
     stopLossPrice: state.stopLossPrice,
     highestPriceSinceEntry: state.highestPriceSinceEntry,
     trailingActive: state.trailingActive,
+    adaptiveMode: state.adaptiveMode,
+    adaptiveLabel: getAdaptiveLabel(),
+    lastTradeOutcome: state.lastTradeOutcome,
     statsToday: {
       trades: state.tradesToday,
       wins: state.winsToday, losses: state.lossesToday,
@@ -749,10 +798,17 @@ app.get('/api/admin/dashboard', requireAdminAuth, async (req, res) => {
         maxTradesPerDay: 'UNLIMITED - 24/7',
         maxConsecutiveLosses: DEFAULTS.MAX_CONSECUTIVE_LOSSES,
         activeHoursWAT: '24/7 - No Restriction',
+        adaptiveMode: state.adaptiveMode,
+        adaptiveLabel: getAdaptiveLabel(),
+        lastTradeOutcome: state.lastTradeOutcome,
+        trendWindow10m: DEFAULTS.PRICE_WINDOW_10M,
+        trendWindow30m: DEFAULTS.PRICE_WINDOW_30M,
       },
       market: {
         dateWAT: state.currentDate, lastPrice: state.lastPrice,
         rollingAvg: getRollingAverage(state.priceHistory),
+        rollingAvg10m: getRollingAverage(state.priceHistory.slice(-DEFAULTS.PRICE_WINDOW_10M)),
+        rollingAvg30m: getRollingAverage(state.priceHistory.slice(-DEFAULTS.PRICE_WINDOW_30M)),
         referencePrice: state.referencePrice, buyTargetPrice: state.buyTargetPrice,
         cooldownUntil: state.cooldownUntil,
       },
